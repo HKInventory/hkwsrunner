@@ -1,0 +1,9 @@
+{
+  "name": "hk-workshop-runner",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Instant push of app-created repairs & notes into RaceFacer via Supabase Realtime.",
+  "engines": { "node": ">=20" },
+  "scripts": { "start": "node index.js" },
+  "dependencies": { "@supabase/supabase-js": "^2.45.4" }
+}
