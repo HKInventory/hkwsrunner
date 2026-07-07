@@ -1,8 +1,0 @@
-{
-  "name": "hk-workshop-runner",
-  "version": "1.0.0",
-  "private": true,
-  "description": "Pushes app-created repairs & notes into RaceFacer, and (optionally) keeps a health endpoint alive.",
-  "engines": { "node": ">=20" },
-  "scripts": { "start": "node index.js" }
-}
