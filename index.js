@@ -24,10 +24,12 @@ startRepairPusher(/* scrapeKartRepairs */);
    never parsed reliably and guessing at its markup burns rounds; open the route once,
    send the HTML, and the parser can be made exact.
 
-   Set DEBUG_TOKEN in Render -> Environment. Without it the routes 404, because the
-   dump is an authenticated RaceFacer page.  Optional &kart=26 picks the kart.
+   The token is baked in below — nothing to configure in Render. It guards the routes
+   because the dump is an AUTHENTICATED RaceFacer page: anyone holding this token plus the
+   service URL could read it. Once the warehouse syncs, set DEBUG_TOKEN='' (or delete this
+   block) to switch the routes off again.  Optional &kart=26 picks the kart.
 --------------------------------------------------------------------------- */
-const DEBUG_TOKEN = process.env.DEBUG_TOKEN || '';
+const DEBUG_TOKEN = process.env.DEBUG_TOKEN || 'bkvcndALZnZF7j36k2t337yZTPpm4qrPIHt58Ley';
 
 function notFound(res) {
   res.writeHead(404, { 'Content-Type': 'text/plain' });
