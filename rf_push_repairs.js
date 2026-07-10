@@ -68,6 +68,76 @@ function parseOptions(html, selectNameRegex){
   while ((m = re.exec(sel[1]))) out[norm(m[2].replace(/<[^>]+>/g,'').trim())] = { id: Number(m[1]) };
   return out;
 }
+/* ---- diagnostics ---------------------------------------------------------------------
+   A Render Background Worker exposes no HTTP port, so the only place Harvey can read a
+   dump from is the database. Keep payloads bounded; rf_debug self-trims to 20 rows. */
+async function rfDebug(kind, kartId, note, payload){
+  try{
+    await supa.from('rf_debug').insert({ kind, kart_id: kartId || null, note: String(note || '').slice(0, 500),
+      payload: String(payload || '').slice(0, 400000) });
+  }catch(e){ console.error('[rf-push] rf_debug insert:', e.message || e); }
+}
+
+/* ---- Select2 -------------------------------------------------------------------------
+   RaceFacer renders "Parts used" with Select2. When Select2 is AJAX-backed the server sends
+   an EMPTY <select> and loads the options on click, so nothing we scrape from the page HTML
+   will ever contain the parts. Find the endpoint Select2 was told to call, and call it. */
+function discoverPartsAjax(html){
+  const urls = new Set();
+  // .select2({ ... ajax: { url: '/ajax/...' } })  — the url may precede or follow other keys
+  const reInit = /select2\s*\(\s*\{[\s\S]{0,1200}?\}\s*\)/gi;
+  let m;
+  while ((m = reInit.exec(html))){
+    const block = m[0];
+    if (!/ajax/i.test(block)) continue;
+    const u = block.match(/url\s*:\s*[\'"`]([^\'"`]+)[\'"`]/i);
+    if (u) urls.add(u[1]);
+  }
+  // data-ajax--url / data-url on a parts-ish element (Select2's declarative form)
+  const reData = /<[^>]*(?:part|warehouse)[^>]*data-(?:ajax--)?url=[\'"]([^\'"]+)[\'"][^>]*>/gi;
+  while ((m = reData.exec(html))) urls.add(m[1]);
+  // last resort: any URL on the page that smells like a parts feed
+  const reGuess = /[\'"](\/[a-z0-9_\-\/]*(?:warehouse|parts)[a-z0-9_\-\/]*)[\'"]/gi;
+  while ((m = reGuess.exec(html))){ if (!/\.(?:js|css|png|jpg|svg)$/i.test(m[1])) urls.add(m[1]); }
+  return [...urls];
+}
+function _rowsFromAjax(json){
+  const arr = Array.isArray(json) ? json
+            : Array.isArray(json?.results) ? json.results
+            : Array.isArray(json?.data) ? json.data
+            : Array.isArray(json?.items) ? json.items : [];
+  const out = [];
+  for (const o of arr){
+    if (!o || typeof o !== 'object') continue;
+    const pid  = o.part_id ?? o.id ?? o.value;
+    const name = o.name ?? o.text ?? o.title ?? o.label;
+    if (pid == null || !name) continue;
+    out.push({ part_id:Number(pid), id:Number(o.id ?? pid), max_qty:Number(o.max_qty ?? o.qty ?? o.quantity ?? 99),
+               price:Number(o.price ?? 0), name:String(name).trim() });
+  }
+  return out.filter(r => Number.isFinite(r.part_id) && r.name);
+}
+async function fetchPartsAjax(html, kartId){
+  const cands = discoverPartsAjax(html);
+  for (const raw of cands){
+    const url = raw.startsWith('http') ? raw : RF_BASE + (raw.startsWith('/') ? raw : '/' + raw);
+    // Select2 sends the search term as `q` (or `term`), plus paging. Empty term = everything.
+    const qs = `q=&term=&page=1&kart_id=${encodeURIComponent(kartId || '')}`;
+    const tryUrl = url + (url.includes('?') ? '&' : '?') + qs;
+    try{
+      const r = await fetch(tryUrl, { agent, headers: rfHeaders({ Accept:'application/json', Referer:`${RF_BASE}/en/administration/garage/damage?kart_id=${kartId}` }), redirect:'manual' });
+      if (r.status >= 400 || /login/i.test(r.headers.get('location') || '')) continue;
+      const text = await r.text();
+      let json; try { json = JSON.parse(text); } catch { continue; }
+      const rows = _rowsFromAjax(json);
+      if (rows.length > 1){ console.log(`[rf-push] parts via Select2 AJAX ${raw} -> ${rows.length}`); return rows; }
+      await rfDebug('parts_ajax', kartId, `tried ${raw}, parsed ${rows.length}`, text);
+    }catch(e){ /* try the next candidate */ }
+  }
+  if (cands.length) console.log('[rf-push] select2 endpoints tried, none returned parts:', cands.join(', '));
+  return [];
+}
+
 /* ---- parts warehouse: four strategies, best score wins -----------------------------------
    RaceFacer's Add-damage page has never parsed reliably with a single regex, so try each
    plausible shape and keep whichever yields the most usable {id, name} rows. A part is only
@@ -146,6 +216,16 @@ function parseParts(html){
   for (const r of (best ? best.rows : [])) parts[norm(r.name)] = r;
   return parts;
 }
+/* AJAX first (that is where a Select2 widget really keeps its options), HTML second. */
+async function resolvePartsList(html, kartId){
+  const viaAjax = await fetchPartsAjax(html, kartId);
+  if (viaAjax.length > 1){
+    const parts = {};
+    for (const r of viaAjax) parts[norm(r.name)] = r;
+    return parts;
+  }
+  return parseParts(html);
+}
 /* Raw HTML of the Add-damage page, for the token-guarded /debug endpoint in index.js. */
 async function dumpDamagePage(kartId){
   if (!loggedIn) await rfLogin();
@@ -161,7 +241,7 @@ async function formContext(kartId){
   const html = await r.text();
   const token = html.match(/name="_token"[^>]*value="([^"]+)"/)?.[1] || html.match(/csrf-token"[^>]*content="([^"]+)"/)?.[1] || '';
   const users = parseOptions(html, 'name="user_id"');
-  const parts = parseParts(html);
+  const parts = await resolvePartsList(html, kartId);
   const kart_type_id = Number(html.match(/kart_type_id["']?\s*[:=]\s*["']?(\d+)/i)?.[1] || html.match(/name="kart_type"[^>]*value="(\d+)"/i)?.[1] || 0);
   return { token, users, parts, kart_type_id, html };
 }
@@ -179,6 +259,35 @@ function resolvePart(p, parts){
   return null;
 }
 
+/* ---------------- response handling ----------------------------------------------------
+   RaceFacer answers its /ajax/* routes with HTTP 200 even when it refuses the request; the
+   verdict is in the body. Checking only the status code made refusals look like successes.
+   Returns null when the call really did succeed, or RaceFacer's own reason when it didn't. */
+async function rfBody(r){
+  let txt = '';
+  try { txt = await r.text(); } catch { /* empty body is fine */ }
+  let j = null;
+  try { j = JSON.parse(txt); } catch { /* not JSON — a fragment or a redirect page */ }
+  return { txt, j };
+}
+function rfFailure(status, txt, j){
+  if (status >= 400) return `HTTP ${status}` + (txt ? `: ${txt.slice(0, 200)}` : '');
+  if (j && typeof j === 'object'){
+    const bad = j.success === false || j.status === false || j.ok === false || !!j.error
+      || (Array.isArray(j.errors) && j.errors.length)
+      || (j.errors && typeof j.errors === 'object' && Object.keys(j.errors).length);
+    if (bad){
+      const msg = j.message || j.error
+        || (j.errors ? (Array.isArray(j.errors) ? j.errors.join('; ') : Object.values(j.errors).flat().join('; ')) : '')
+        || 'RaceFacer rejected the request';
+      return String(msg).slice(0, 300);
+    }
+  }
+  // A login form in the body means the session died mid-request.
+  if (/name=["']password["']|\/auth\/login/i.test(txt)) return 'session expired (login form returned)';
+  return null;
+}
+
 /* ---------------- submitters ---------------- */
 async function rfCreateNote(row){
   const ctx = await formContext(row.rf_kart_id);
@@ -192,7 +301,9 @@ async function rfCreateNote(row){
       Referer:`${RF_BASE}/en/administration/garage/garage?kart_id=${row.rf_kart_id}&action=maintenances` }), body });
   absorb(r);
   if (r.status===401 || /login/i.test(r.headers.get('location')||'')) { loggedIn=false; throw new Error('session expired'); }
-  if (r.status>=400) throw new Error(`notes/add: ${r.status}`);
+  const { txt, j } = await rfBody(r);
+  const fail = rfFailure(r.status, txt, j);
+  if (fail){ await rfDebug('note', row.rf_kart_id, `notes/add refused: ${fail}`, txt); throw new Error(`notes/add: ${fail}`); }
 }
 async function rfCreateDamage(row){
   const ctx = await formContext(row.rf_kart_id);
@@ -212,7 +323,9 @@ async function rfCreateDamage(row){
       Referer:`${RF_BASE}/en/administration/garage/damage?kart_id=${row.rf_kart_id}&referer=repairs` }), body });
   absorb(r);
   if (r.status===401 || /login/i.test(r.headers.get('location')||'')) { loggedIn=false; throw new Error('session expired'); }
-  if (r.status>=400) throw new Error(`garage/damage: ${r.status}`);
+  const { txt, j } = await rfBody(r);
+  const fail = rfFailure(r.status, txt, j);
+  if (fail){ await rfDebug('damage', row.rf_kart_id, `garage/damage refused: ${fail}`, txt); throw new Error(`garage/damage: ${fail}`); }
 }
 
 async function rfCreateStatus(row){
@@ -223,7 +336,16 @@ async function rfCreateStatus(row){
       Referer:`${RF_BASE}/en/administration/garage/garage` }), body });
   absorb(r);
   if (r.status===401 || /login/i.test(r.headers.get('location')||'')) { loggedIn=false; throw new Error('session expired'); }
-  if (r.status>=400) throw new Error(`kart/status: ${r.status}`);
+  const { txt, j } = await rfBody(r);
+  const fail = rfFailure(r.status, txt, j);
+  if (fail){
+    // Setting a kart back to OK is the one that gets refused: RaceFacer will not clear a kart
+    // while it still has an open damage/note. Its own wording lands in rf_debug and in the
+    // queue row's error column, which the app now reads back to the user.
+    await rfDebug('status', row.rf_kart_id, `kart/status ${row.kart_status_id} refused: ${fail}`, txt);
+    throw new Error(`kart/status ${row.kart_status_id}: ${fail}`);
+  }
+  console.log(`[rf-push] kart ${row.rf_kart_id} -> status ${row.kart_status_id} accepted`);
 }
 
 /* ---------------- queue drain (locked so realtime + poll never overlap) ---------------- */
@@ -269,7 +391,14 @@ async function syncWarehouse(){ // publish RaceFacer's parts list so the app dro
       if (rows.length > 1){ console.log(`[rf-push] warehouse: ${rows.length} parts from kart ${kartId}`); break; }
     }
     if (rows.length < 2){
-      console.log('[rf-push] warehouse: still no parts. Hit  /debug/damage?token=…  on this service and send the HTML.');
+      // A Background Worker has no public URL, so stash the page in Supabase instead:
+      //   select payload from rf_debug where kind='damage_html' order by id desc limit 1;
+      const kartId = karts[0];
+      const ctx = await formContext(kartId);
+      await rfDebug('damage_html', kartId,
+        `parts parsed: ${rows.length}. select2 endpoints seen: ${discoverPartsAjax(ctx.html).join(' | ') || 'none'}`,
+        ctx.html);
+      console.log('[rf-push] warehouse: no parts. Page captured -> select payload from rf_debug order by id desc limit 1;');
       if (!rows.length) return;
     }
     const { error } = await supa.from('rf_warehouse').upsert(rows, { onConflict:'part_id' });
@@ -292,4 +421,4 @@ function startRepairPusher(scrape){
   syncWarehouse();
   setInterval(syncWarehouse, 6 * 60 * 60 * 1000);   // refresh the parts list every 6h
 }
-module.exports = { startRepairPusher, rfLogin, dumpDamagePage };
+module.exports = { startRepairPusher, rfLogin, dumpDamagePage, discoverPartsAjax, parseParts, _rowsFromAjax };
