@@ -573,14 +573,22 @@ async function syncKartNotes(id, site, activeFps) {
   // kart; anything in the DB for this kart but not in that set was deleted upstream -> delete it here,
   // which fires the realtime DELETE the app now listens for. An empty RaceFacer list legitimately means
   // "all notes deleted", so we still prune then (the per-kart fetch already succeeded).
+  //
+  // IMPORTANT: delete ONE fingerprint per request. Cramming many long note texts into a single
+  // ?note_fp=in.(...) URL makes a huge query string that Supabase's API worker rejects with a 1101
+  // "Worker threw exception". Fingerprints are long free text, so even ~10 blows the URL limit.
   try {
     const have = (await sb(`rf_kart_notes?rf_kart_id=eq.${id}&select=note_fp`)) || [];
     const gone = have.map((r) => r.note_fp).filter((fp) => fp && !batch.has(fp));
-    if (gone.length) {
-      const list = gone.map((fp) => `"${String(fp).replace(/"/g, '%22')}"`).join(',');
-      await sb(`rf_kart_notes?rf_kart_id=eq.${id}&note_fp=in.(${list})`, { method: 'DELETE' });
-      console.log(`[notes] kart ${id}: removed ${gone.length} deleted in RaceFacer`);
+    let removed = 0;
+    for (const fp of gone) {
+      try {
+        // eq. filter on a single value, URL-encoded — small, safe request.
+        await sb(`rf_kart_notes?rf_kart_id=eq.${id}&note_fp=eq.${encodeURIComponent(fp)}`, { method: 'DELETE' });
+        removed++;
+      } catch (e) { console.error(`[notes] kart ${id} delete one failed: ${e.message}`); }
     }
+    if (removed) console.log(`[notes] kart ${id}: removed ${removed} deleted in RaceFacer`);
   } catch (e) { console.error(`[notes] kart ${id} delete-sync failed: ${e.message}`); }
 
   return rows.length;
