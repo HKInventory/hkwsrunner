@@ -521,7 +521,7 @@ async function syncKart(id, meta, repairsByKart) {
   let notesWritten = 0;
   // Which notes is RaceFacer currently showing in its top "active" list (starred, not X'd)?
   // Their fingerprints match the same notes in the Kart Notes table, so we can flag them.
-  const activeFps = new Set(parseActiveNotes(dj.html).map((n) => noteFp(id, n)));
+  const activeFps = activeNoteMap(id, dj.html);   // Map(fp -> notifId): flags active notes AND captures the id a repair needs to clear them
   try { notesWritten = await syncKartNotes(id, site, activeFps); } catch (e) { console.error(`[notes] kart ${id} failed: ${e.message}`); }
 
   return { id, name: details.name, type: type, site: site, label: kartLabel(type, details.name), repairs, notesWritten };
@@ -536,6 +536,14 @@ async function syncKart(id, meta, repairsByKart) {
 // authoritative current list for THIS kart, so after upserting we DELETE any rf_kart_notes row for this
 // kart whose fingerprint is no longer present. Scoped per-kart and only when the fetch succeeded, so a
 // transient RaceFacer error can never wipe a kart's notes — a failed fetch throws before we get here.
+/* fp -> RaceFacer notification id for a kart's ACTIVE notes. The id is what a repair must send
+   as notification_id to CLEAR the note; parseActiveNotes digs it out of the row's X button. */
+function activeNoteMap(id, html) {
+  const map = new Map();
+  for (const a of parseActiveNotes(html || '')) map.set(noteFp(id, a), (a.notifId != null ? a.notifId : null));
+  return map;
+}
+
 async function syncKartNotes(id, site, activeFps) {
   const notesRaw = await rfJson(`/ajax/garage/kart-notes?id=${id}`);
   const notes = parseKartNotes(notesRaw);
@@ -558,6 +566,9 @@ async function syncKartNotes(id, site, activeFps) {
     } catch (e) { /* diagnostic only */ }
   }
 
+  // activeFps may be a legacy Set of fingerprints, or a Map(fp -> notifId).
+  const isMap = activeFps && typeof activeFps.get === 'function';
+  const activeSet = isMap ? new Set(activeFps.keys()) : (activeFps || new Set());
   const rows = [], batch = new Set();
   for (const n of notes) {
     const fp = noteFp(id, n);
@@ -565,9 +576,23 @@ async function syncKartNotes(id, site, activeFps) {
     batch.add(fp);
     rows.push({ note_fp: fp, rf_kart_id: id, site, note: n.note,
       created_at: toUtc(n.createdIso), created_by: n.createdBy, archived_at: toUtc(n.archivedIso), archived_by: n.archivedBy,
-      active: activeFps ? activeFps.has(fp) : false });
+      active: activeSet.has(fp),
+      // RaceFacer's notification id — the number that lets a repair CLEAR this note. Null when the
+      // note isn't in the active list or the id couldn't be read from the markup.
+      rf_notification_id: (isMap && activeFps.get(fp) != null) ? activeFps.get(fp) : null });
   }
-  if (rows.length) await sb('rf_kart_notes?on_conflict=note_fp', { method: 'POST', prefer: 'resolution=merge-duplicates', body: rows });
+  if (rows.length) {
+    try {
+      await sb('rf_kart_notes?on_conflict=note_fp', { method: 'POST', prefer: 'resolution=merge-duplicates', body: rows });
+    } catch (e) {
+      // If the rf_notification_id column hasn't been added yet (rf_debug.sql part 0), retry without
+      // it so note syncing never stalls on a missing migration.
+      if (/rf_notification_id/.test(e.message || '')) {
+        const bare = rows.map(({ rf_notification_id, ...r }) => r);
+        await sb('rf_kart_notes?on_conflict=note_fp', { method: 'POST', prefer: 'resolution=merge-duplicates', body: bare });
+      } else throw e;
+    }
+  }
 
   // Remove notes deleted in RaceFacer. `batch` is every fingerprint RaceFacer currently lists for this
   // kart; anything in the DB for this kart but not in that set was deleted upstream -> delete it here,
@@ -688,12 +713,39 @@ async function notesFast(garageFlags) {
   for (const id of ids) {
     try {
       const dj = await rfJson(`/ajax/garage/kart-details?id=${id}`);
-      const activeFps = new Set(parseActiveNotes((dj && dj.html) || '').map((n) => noteFp(id, n)));
+      const activeFps = activeNoteMap(id, (dj && dj.html) || '');
       await syncKartNotes(id, site, activeFps);
       touched++;
     } catch (e) { /* one kart failing this cycle is fine; the sweep comes back around */ }
     await sleep(80);
   }
+  return touched;
+}
+
+/* FULL-FLEET NOTES SWEEP — parallel, for the worker's persistent in-process loop.
+   Fetches every kart's detail page with a small worker pool (default 8 concurrent) over ONE
+   logged-in session, so the whole fleet's notes refresh in ~6-8s. syncKartNotes only writes
+   when a note actually changed, so a quiet sweep costs zero realtime messages.
+   Aborts if a third of requests error (RaceFacer struggling) — the next sweep retries. */
+async function sweepNotesAll({ concurrency = 8 } = {}) {
+  const site = process.env.SITE || 'sydney';
+  const fleet = ((await sb('rf_karts?select=rf_id&order=rf_id')) || []).map((r) => r.rf_id).filter((x) => x != null);
+  if (!fleet.length) return 0;
+  let i = 0, touched = 0, errors = 0;
+  async function workerFn() {
+    while (i < fleet.length) {
+      const id = fleet[i++];
+      try {
+        const dj = await rfJson(`/ajax/garage/kart-details?id=${id}`);
+        await syncKartNotes(id, site, activeNoteMap(id, (dj && dj.html) || ''));
+        touched++;
+      } catch (e) {
+        errors++;
+        if (errors > Math.max(10, fleet.length * 0.3)) throw new Error(`sweep aborted after ${errors} errors: ${e.message}`);
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, fleet.length) }, () => workerFn()));
   return touched;
 }
 
@@ -743,9 +795,17 @@ async function main() {
   if (!RF_USER || !RF_PASS || !SB_URL || !SB_KEY) throw new Error('missing required env vars');
   await login();
 
-  // STATUS_ONLY mode (the dedicated fast loop): refresh OK/Damaged/Maintenance AND run the fast notes
-  // pass so a note add/delete in RaceFacer shows in ~10s instead of waiting for the ~2min heavy pass.
-  // statusFast has already fetched the garage list pages, so notesFast reuses their note-flags for free.
+  // NOTES_ONLY mode: just the rotating notes sweep. Status is handled by the worker's in-process
+  // poller now, so this loop is dedicated to catching note add/edit/delete across the fleet fast.
+  if (process.env.NOTES_ONLY === '1') {
+    let notes = 0;
+    try { notes = await notesFast(null); } catch (e) { console.error('[notes-fast]', e.message); }
+    if (notes) console.log(`[notes] swept ${notes} kart(s).`);
+    return;
+  }
+
+  // STATUS_ONLY mode (legacy fallback if the in-process poller isn't used): refresh
+  // OK/Damaged/Maintenance AND run the fast notes pass in one spawned cycle.
   if (process.env.STATUS_ONLY === '1') {
     const n = await statusFast();
     let notes = 0;
@@ -799,4 +859,4 @@ async function main() {
 }
 
 if (require.main === module) main().catch((e) => { console.error(e); process.exit(1); });
-module.exports = { login, enumerateKarts, syncKart, statusFast, reconcileToday, logTrackSegments, refreshLiveTracks };
+module.exports = { login, enumerateKarts, syncKart, statusFast, reconcileToday, logTrackSegments, refreshLiveTracks, sweepNotesAll };

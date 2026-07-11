@@ -176,7 +176,21 @@ function parseActiveNotes(detailsHtml) {
     const createdIso = m ? `${m[3]}-${m[2]}-${m[1]}T${m[4]}:00` : null;
     const note = txt($(tds[1]).clone().find('i').remove().end().text());   // drop the star icon, keep the text
     if (!note) return;
-    out.push({ createdIso, note });
+    // RaceFacer's NOTIFICATION id (the ?note_id=26653 number) — needed for a repair to CLEAR its
+    // note. It rides in this row's markup, almost certainly on the X button. Try, in order:
+    //  1. an explicit note_id / notification_id anywhere in the row
+    //  2. a function-call number in the X cell's onclick, e.g. delete_notification(26653)
+    //  3. a data-id / data-note-id on the row
+    //  4. any 5+ digit number in the X cell (5+ so a bare year like 2026 can't match)
+    let notifId = null;
+    const rowHtml = $.html(tr) || '';
+    const xHtml = tds.length > 2 ? ($.html(tds[2]) || '') : '';
+    let idm = rowHtml.match(/(?:note[_-]?id|notification[_-]?id)\D{0,6}(\d{3,})/i)
+           || xHtml.match(/\(\s*(\d{4,})\s*[,)]/)
+           || (() => { const d = $(tr).attr('data-id') || $(tr).attr('data-note-id'); return d && /^\d+$/.test(d) ? [null, d] : null; })()
+           || xHtml.match(/(\d{5,})/);
+    if (idm) notifId = Number(idm[1]);
+    out.push({ createdIso, note, notifId });
   });
   return out;
 }

@@ -40,9 +40,73 @@ const path = require('path');
 const { startRepairPusher } = require('./rf_push_repairs');
 startRepairPusher(/* scrapeKartRepairs */);   // optional: pass a per-kart re-scrape fn if you have one
 
-// ---- 2 + 3. the RaceFacer -> app sync loops (spawn racefacer-sync.js) ------
+// ---- PERSISTENT STATUS POLLER (in-process, no re-spawn/re-login) -----------
+// Status changes must feel instant. Spawning a fresh racefacer-sync.js each cycle re-logs into
+// RaceFacer (~1-2s handshake) EVERY time, which caps how fast we can go. So status runs here,
+// in-process: log in ONCE, then hit the ~5 garage list pages on a tight loop and write only the
+// karts whose status flipped. ~5 requests/cycle is well within what RaceFacer tolerates.
+const sync = require('./racefacer-sync');
+const STATUS_POLL = Math.max(2, parseInt(process.env.STATUS_POLL_SEC   || '2', 10)) * 1000;
+const NOTES_CONC  = Math.max(2, Math.min(12, parseInt(process.env.NOTES_CONCURRENCY || '8', 10)));
+const NOTES_PAUSE = Math.max(1, parseInt(process.env.NOTES_GAP_SEC     || '2', 10)) * 1000;
+
+// ONE login shared by the status poller and the notes sweeper (same module = same cookie jar).
+// The promise-guard stops both loops logging in at the same moment; an auth error resets it so
+// the next call re-authenticates.
+let _loginP = null;
+function ensureLogin(){ if (!_loginP) _loginP = sync.login().then(() => { log('RaceFacer session up'); }); return _loginP.catch((e) => { _loginP = null; throw e; }); }
+function dropLogin(){ _loginP = null; }
+function sleep(ms){ return new Promise((r) => setTimeout(r, ms)); }
+
+// STATUS: ~5 list pages per poll, whole fleet, every STATUS_POLL. Write-on-change.
+async function statusPoller(){
+  let fails = 0;
+  while (!stopping){
+    const t0 = Date.now();
+    try {
+      await ensureLogin();
+      const changed = await sync.statusFast();
+      if (typeof sync.refreshLiveTracks === 'function') { try { await sync.refreshLiveTracks(); } catch (e) {} }
+      fails = 0;
+      if (changed) log(`status: ${changed} kart(s) changed`);
+    } catch (e){
+      fails++;
+      if (/login|session|401|403/i.test(e.message || '')) dropLogin();
+      if (fails <= 3 || fails % 10 === 0) log(`status poll error (${fails}): ${e.message}`);
+      if (fails > 3) await sleep(Math.min(30000, fails * 1000));   // back off if RaceFacer is unhappy
+    }
+    const spent = Date.now() - t0;
+    await sleep(Math.max(0, STATUS_POLL - spent));
+  }
+}
+
+// NOTES: parallel full-fleet sweep (~6-8s for 211 karts at concurrency 8) on the SAME session —
+// no per-cycle login. A note added/edited/deleted in RaceFacer lands in the app within one
+// sweep + pause, i.e. well under 10s. syncKartNotes writes only on change, so realtime cost of a
+// quiet sweep is zero.
+async function notesSweeper(){
+  let fails = 0, sweeps = 0;
+  await sleep(4000);                              // let the status poller establish the session first
+  while (!stopping){
+    const t0 = Date.now();
+    try {
+      await ensureLogin();
+      await sync.sweepNotesAll({ concurrency: NOTES_CONC });
+      fails = 0; sweeps++;
+      const secs = (Date.now() - t0) / 1000;
+      if (sweeps % 50 === 1 || secs > 12) log(`notes sweep #${sweeps}: ${secs.toFixed(1)}s (concurrency ${NOTES_CONC})`);
+    } catch (e){
+      fails++;
+      if (/login|session|401|403/i.test(e.message || '')) dropLogin();
+      log(`notes sweep error (${fails}): ${e.message}`);
+      await sleep(Math.min(30000, 2000 * fails)); // RaceFacer struggling -> ease off, then resume
+    }
+    await sleep(NOTES_PAUSE);
+  }
+}
+
+// ---- HEAVY sync loop (spawn racefacer-sync.js; own process + login is fine at this cadence) ----
 const SCRIPT     = path.join(__dirname, 'racefacer-sync.js');
-const STATUS_GAP = Math.max(5,   parseInt(process.env.STATUS_GAP_SEC    || '5',   10)) * 1000;
 const HEAVY_GAP  = Math.max(60,  parseInt(process.env.HEAVY_GAP_SEC     || '120', 10)) * 1000;
 const TIMEOUT_MS = Math.max(120, parseInt(process.env.CYCLE_TIMEOUT_SEC || '600', 10)) * 1000;
 const SITE       = process.env.SITE || 'sydney';
@@ -74,21 +138,21 @@ function loop(tag, gapMs, extraEnv){
   return { start(delay){ timer = setTimeout(run, delay || 0); }, stop(){ clearTimeout(timer); } };
 }
 
-log(`combined worker up · site=${SITE} · pusher live · status ~${STATUS_GAP / 1000}s · full-sync gap ~${HEAVY_GAP / 1000}s`);
+log(`combined worker up · site=${SITE} · pusher live · status ~${STATUS_POLL / 1000}s · notes sweep concurrency ${NOTES_CONC} · full-sync ~${HEAVY_GAP / 1000}s`);
 
-const statusLoop = loop('status', STATUS_GAP, { STATUS_ONLY: '1' });
-// Force each heavy child to run the full pass: HEAVY_INTERVAL_SEC is clamped to 60s inside
-// racefacer-sync.js and is always < time-since-last-heavy, so the gate opens every cycle.
-const heavyLoop  = loop('heavy',  HEAVY_GAP,  { STATUS_ONLY: '', HEAVY_INTERVAL_SEC: '60' });
+// Status + notes: persistent in-process loops sharing ONE RaceFacer session.
+statusPoller().catch((e) => log(`status poller crashed: ${e.message}`));
+notesSweeper().catch((e) => log(`notes sweeper crashed: ${e.message}`));
 
-statusLoop.start(2000);   // let the pusher's realtime socket connect first
-heavyLoop.start(6000);    // stagger so the first RaceFacer logins don't collide
+// Heavy: full reconcile (repairs, parts, prune, reconcile) in its own spawned process.
+const heavyLoop = loop('heavy', HEAVY_GAP, { STATUS_ONLY: '', NOTES_ONLY: '', HEAVY_INTERVAL_SEC: '60' });
+heavyLoop.start(9000);   // stagger so the first RaceFacer logins don't collide
 
 function shutdown(sig){
   if (stopping) return;
   stopping = true;
   log(`${sig} received — stopping sync loops`);
-  statusLoop.stop(); heavyLoop.stop();
+  heavyLoop.stop();
   setTimeout(() => process.exit(0), 1000);
 }
 process.on('SIGINT',  () => shutdown('SIGINT'));
