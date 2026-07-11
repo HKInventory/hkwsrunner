@@ -653,38 +653,47 @@ async function pruneStale(activeIds) {
 //
 // Net: a note added to a clean kart, or the last note removed from a kart, is caught in one status
 // cycle (~10s) with ~0 extra requests; only genuinely-changed karts get an individual fetch.
+// Rotating cursor so successive fast cycles cover different karts, sweeping the whole fleet
+// every ~30s without fetching all 211 every cycle.
+let _noteCursor = 0;
 async function notesFast(garageFlags) {
   const site = process.env.SITE || 'sydney';
-  // What the DB currently thinks has an open note.
+
+  // The fleet's kart ids (from rf_karts). This is what we rotate through.
+  let fleet = [];
+  try { fleet = ((await sb('rf_karts?select=rf_id&order=rf_id')) || []).map((r) => r.rf_id).filter((x) => x != null); }
+  catch (e) { console.error(`[notes-fast] read fleet: ${e.message}`); return 0; }
+  if (!fleet.length) return 0;
+
+  // Karts that already have an open note in the DB — always re-checked so an edit or the last
+  // note being deleted syncs immediately.
   let dbActive = [];
-  try { dbActive = (await sb('rf_kart_notes?active=eq.true&select=rf_kart_id')) || []; }
-  catch (e) { console.error(`[notes-fast] read active: ${e.message}`); return 0; }
+  try { dbActive = (await sb('rf_kart_notes?active=eq.true&select=rf_kart_id')) || []; } catch (e) {}
   const dbFlag = new Set(dbActive.map((r) => r.rf_kart_id).filter((x) => x != null));
 
-  const toCheck = new Set();
-  if (garageFlags && garageFlags.size) {
-    // karts RaceFacer now flags but the DB doesn't -> a note was ADDED
-    for (const id of garageFlags) if (!dbFlag.has(id)) toCheck.add(id);
-    // karts the DB flags but RaceFacer no longer does -> the note was DELETED/resolved
-    for (const id of dbFlag) if (!garageFlags.has(id)) toCheck.add(id);
+  // Per-cycle set: everything currently flagged in the DB, PLUS a rotating slice of the rest of
+  // the fleet so brand-new notes on a previously-clean kart are picked up within a full rotation.
+  // parseGarageStatuses does NOT expose a note indicator, so we can't tell which clean kart just
+  // got a note — hence the rotating sweep rather than a targeted check.
+  const BATCH = parseInt(process.env.NOTES_FAST_BATCH, 10) || 40;   // karts swept per cycle
+  const toCheck = new Set(dbFlag);
+  if (garageFlags && garageFlags.size) for (const id of garageFlags) if (!dbFlag.has(id)) toCheck.add(id);
+  for (let i = 0; i < BATCH && i < fleet.length; i++) {
+    toCheck.add(fleet[(_noteCursor + i) % fleet.length]);
   }
-  // plus everything with an open note, so edits and multi-note deletes on a still-flagged kart sync
-  for (const id of dbFlag) toCheck.add(id);
+  _noteCursor = (_noteCursor + BATCH) % fleet.length;   // advance for next cycle
 
   const ids = [...toCheck];
-  if (!ids.length) return 0;
-  const MAX = parseInt(process.env.NOTES_FAST_MAX, 10) || 60;   // safety cap; heavy pass covers any overflow
   let touched = 0;
-  for (const id of ids.slice(0, MAX)) {
+  for (const id of ids) {
     try {
       const dj = await rfJson(`/ajax/garage/kart-details?id=${id}`);
       const activeFps = new Set(parseActiveNotes((dj && dj.html) || '').map((n) => noteFp(id, n)));
       await syncKartNotes(id, site, activeFps);
       touched++;
-    } catch (e) { /* one kart failing this cycle is fine; heavy pass reconciles */ }
-    await sleep(120);
+    } catch (e) { /* one kart failing this cycle is fine; the sweep comes back around */ }
+    await sleep(80);
   }
-  if (ids.length > MAX) console.log(`[notes-fast] ${ids.length} flagged, checked ${MAX} (cap); heavy pass covers the rest`);
   return touched;
 }
 
