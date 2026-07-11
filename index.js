@@ -1,84 +1,96 @@
-/* HK Workshop runner — entry point.
+#!/usr/bin/env node
+/*
+ * HK Workshop — COMBINED Render worker (both sync directions in one service).
+ * ------------------------------------------------------------------------
+ * This single process replaces BOTH the old GitHub sync workflows AND runs the
+ * app->RaceFacer pusher, so you only pay for one Render Background Worker.
+ *
+ * It runs three things at once:
+ *   1. PUSHER (persistent)  — app -> RaceFacer. Fires on Supabase realtime the
+ *      instant you save a repair/note/status; pushes to RaceFacer in ~1.5-3s.
+ *      (from rf_push_repairs.js)
+ *   2. STATUS loop (~5s)     — RaceFacer -> app. Fast OK/Damaged/Maintenance +
+ *      note add/delete detection. Spawns racefacer-sync.js with STATUS_ONLY=1.
+ *   3. HEAVY loop (~2min)    — RaceFacer -> app. Full sync: repairs, parts, notes,
+ *      prune, reconcile. Spawns racefacer-sync.js with the full pass enabled.
+ *
+ * The two sync loops SPAWN racefacer-sync.js as short-lived child processes (fresh
+ * RaceFacer login each cycle, no memory growth, a stuck child is killed on timeout).
+ * The pusher runs in THIS process because it must hold a persistent realtime socket.
+ *
+ * The pusher and the sync don't fight: the pusher is bursty and quick, the sync is a
+ * steady poll. If they ever collide they briefly take turns (~1-2s), never a stall.
+ *
+ * Env (same as before): RF_USER, RF_PASS, SB_URL, SB_SERVICE_KEY, SITE
+ *   plus optional tuning:
+ *     STATUS_GAP_SEC     pause between status cycles   (default 5,   min 5)
+ *     HEAVY_GAP_SEC      pause between full syncs       (default 120, min 60)
+ *     CYCLE_TIMEOUT_SEC  kill a stuck sync child after  (default 600, min 120)
+ */
+'use strict';
 
-   IMPORTANT: RaceFacer (103.166.146.163) uses a self-signed TLS certificate, and
-   Node's global fetch (undici) ignores the https.Agent option — so without the line
-   below, every RaceFacer request throws "fetch failed". This runner only talks to
-   Supabase (valid cert) and RaceFacer, so disabling strict TLS process-wide is safe.
-   (Node will print a one-line "insecure TLS" warning on boot — that's expected.) */
+// RaceFacer uses a self-signed cert; Node's global fetch ignores https.Agent, so relax
+// strict TLS process-wide. This process only talks to Supabase (valid cert) and RaceFacer.
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
-const { startRepairPusher, dumpDamagePage } = require('./rf_push_repairs');
+const { spawn } = require('child_process');
+const path = require('path');
 
-// Optional: pass your "re-scrape one kart" function to land repairs in rf_repairs
-// with their real RaceFacer id immediately. Leave empty otherwise.
-startRepairPusher(/* scrapeKartRepairs */);
+// ---- 1. start the app -> RaceFacer pusher (persistent, realtime-driven) ----
+const { startRepairPusher } = require('./rf_push_repairs');
+startRepairPusher(/* scrapeKartRepairs */);   // optional: pass a per-kart re-scrape fn if you have one
 
-/* ---------------------------------------------------------------------------
-   HTTP: health check + a token-guarded debug dump.
+// ---- 2 + 3. the RaceFacer -> app sync loops (spawn racefacer-sync.js) ------
+const SCRIPT     = path.join(__dirname, 'racefacer-sync.js');
+const STATUS_GAP = Math.max(5,   parseInt(process.env.STATUS_GAP_SEC    || '5',   10)) * 1000;
+const HEAVY_GAP  = Math.max(60,  parseInt(process.env.HEAVY_GAP_SEC     || '120', 10)) * 1000;
+const TIMEOUT_MS = Math.max(120, parseInt(process.env.CYCLE_TIMEOUT_SEC || '600', 10)) * 1000;
+const SITE       = process.env.SITE || 'sydney';
 
-     /                       -> "hk-workshop runner ok"
-     /debug/parts?token=...  -> what the parts parser actually extracted (JSON)
-     /debug/damage?token=... -> the RAW HTML of RaceFacer's Add-damage page
+let stopping = false;
+function ts(){ return new Date().toISOString().replace('T', ' ').replace(/\..+/, ''); }
+function log(m){ console.log(`[worker ${ts()}] ${m}`); }
 
-   These routes exist to settle the empty-warehouse problem. The parts <select> has
-   never parsed reliably and guessing at its markup burns rounds; open the route once,
-   send the HTML, and the parser can be made exact.
-
-   The token is baked in below — nothing to configure in Render. It guards the routes
-   because the dump is an AUTHENTICATED RaceFacer page: anyone holding this token plus the
-   service URL could read it. Once the warehouse syncs, set DEBUG_TOKEN='' (or delete this
-   block) to switch the routes off again.  Optional &kart=26 picks the kart.
---------------------------------------------------------------------------- */
-const DEBUG_TOKEN = process.env.DEBUG_TOKEN || 'bkvcndALZnZF7j36k2t337yZTPpm4qrPIHt58Ley';
-
-function notFound(res) {
-  res.writeHead(404, { 'Content-Type': 'text/plain' });
-  res.end('not found\n');
+// One self-rescheduling loop: spawn racefacer-sync.js with extra env, kill a stuck
+// cycle, then wait `gapMs` AFTER it ends before the next (fixed delay => no overlap).
+function loop(tag, gapMs, extraEnv){
+  let n = 0, fails = 0, timer = null;
+  function run(){
+    if (stopping) return;
+    const id = ++n, t0 = Date.now();
+    const child = spawn(process.execPath, [SCRIPT], { stdio: 'inherit', env: { ...process.env, ...extraEnv } });
+    const killer = setTimeout(() => { log(`${tag} #${id} exceeded ${TIMEOUT_MS / 1000}s — killing`); child.kill('SIGKILL'); }, TIMEOUT_MS);
+    function done(code, sig, err){
+      clearTimeout(killer);
+      const secs = ((Date.now() - t0) / 1000).toFixed(1);
+      if (err)             { fails++; log(`${tag} #${id} spawn error: ${err.message} — fails ${fails}`); }
+      else if (code === 0) { /* quiet on success; the child logs its own summary */ }
+      else                 { fails++; log(`${tag} #${id} FAILED code ${code}${sig ? ' ' + sig : ''} (${secs}s) — fails ${fails}`); }
+      if (!stopping) timer = setTimeout(run, gapMs);
+    }
+    child.once('exit',  (code, sig) => done(code, sig, null));
+    child.once('error', (e)         => done(null, null, e));
+  }
+  return { start(delay){ timer = setTimeout(run, delay || 0); }, stop(){ clearTimeout(timer); } };
 }
 
-if (process.env.PORT) {
-  require('http')
-    .createServer(async (req, res) => {
-      let url;
-      try { url = new URL(req.url, 'http://localhost'); } catch { return notFound(res); }
-      const path = url.pathname;
+log(`combined worker up · site=${SITE} · pusher live · status ~${STATUS_GAP / 1000}s · full-sync gap ~${HEAVY_GAP / 1000}s`);
 
-      if (path === '/' || path === '/health') {
-        res.writeHead(200, { 'Content-Type': 'text/plain' });
-        return res.end('hk-workshop runner ok\n');
-      }
+const statusLoop = loop('status', STATUS_GAP, { STATUS_ONLY: '1' });
+// Force each heavy child to run the full pass: HEAVY_INTERVAL_SEC is clamped to 60s inside
+// racefacer-sync.js and is always < time-since-last-heavy, so the gate opens every cycle.
+const heavyLoop  = loop('heavy',  HEAVY_GAP,  { STATUS_ONLY: '', HEAVY_INTERVAL_SEC: '60' });
 
-      if (path === '/debug/damage' || path === '/debug/parts') {
-        // No token configured => the route simply does not exist.
-        if (!DEBUG_TOKEN || url.searchParams.get('token') !== DEBUG_TOKEN) return notFound(res);
-        const kart = url.searchParams.get('kart') || 26;
-        try {
-          const out = await dumpDamagePage(kart);
-          if (path === '/debug/parts') {
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            return res.end(JSON.stringify({
-              kart,
-              kart_type_id: out.kart_type_id,
-              users_found: out.users,
-              parts_found: out.parsedParts.length,
-              parts: out.parsedParts
-            }, null, 2));
-          }
-          res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-          return res.end(out.html);
-        } catch (e) {
-          res.writeHead(500, { 'Content-Type': 'text/plain' });
-          return res.end('debug failed: ' + (e && e.message ? e.message : e) + '\n');
-        }
-      }
+statusLoop.start(2000);   // let the pusher's realtime socket connect first
+heavyLoop.start(6000);    // stagger so the first RaceFacer logins don't collide
 
-      return notFound(res);
-    })
-    .listen(process.env.PORT, () => {
-      console.log('[runner] health endpoint on :' + process.env.PORT);
-      console.log('[runner] debug routes ' + (DEBUG_TOKEN ? 'ENABLED (DEBUG_TOKEN set)' : 'disabled — set DEBUG_TOKEN to enable'));
-    });
+function shutdown(sig){
+  if (stopping) return;
+  stopping = true;
+  log(`${sig} received — stopping sync loops`);
+  statusLoop.stop(); heavyLoop.stop();
+  setTimeout(() => process.exit(0), 1000);
 }
-
-setInterval(() => {}, 1 << 30); // keep the process alive (Background Worker mode)
-process.on('unhandledRejection', (e) => console.error('[runner] unhandledRejection', e && e.message ? e.message : e));
+process.on('SIGINT',  () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('unhandledRejection', (e) => console.error('[worker] unhandledRejection', e && e.message ? e.message : e));

@@ -23,11 +23,11 @@ const agent = new https.Agent({ rejectUnauthorized: false }); // self-signed cer
 const RF_BASE = (process.env.RF_BASE || 'https://103.166.146.163').replace(/\/$/, '');
 const RF_USER = process.env.RF_USER || 'HKWS';
 const RF_PASS = process.env.RF_PASS || 'HKWS';
-const SB_URL  = process.env.SUPABASE_URL;
-const SB_KEY  = process.env.SUPABASE_SERVICE_KEY;
+const SB_URL  = process.env.SUPABASE_URL || process.env.SB_URL;
+const SB_KEY  = process.env.SUPABASE_SERVICE_KEY || process.env.SB_SERVICE_KEY;
 const SAFETY_POLL_MS = Number(process.env.SAFETY_POLL_MS) || 25000;
 
-if (!SB_URL || !SB_KEY) { console.error('[rf-push] missing SUPABASE_URL / SUPABASE_SERVICE_KEY'); process.exit(1); }
+if (!SB_URL || !SB_KEY) { console.error('[rf-push] missing SB_URL / SB_SERVICE_KEY (or SUPABASE_URL / SUPABASE_SERVICE_KEY)'); process.exit(1); }
 const supa = createClient(SB_URL, SB_KEY, { auth: { persistSession: false }, realtime: { params: { eventsPerSecond: 5 } } });
 
 const RF_STATUS_ID = { ok: 1, damaged: 2, for_maintenance: 3 };   // RaceFacer: 1=OK, 2=DAMAGED, 3=MAINTENANCE
