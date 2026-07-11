@@ -15,7 +15,7 @@ const { reconcileDay } = require('./racefacer-reconcile');
 const RF_BASE = process.env.RF_BASE || 'https://103.166.146.163';
 const RF_USER = process.env.RF_USER, RF_PASS = process.env.RF_PASS;
 const SB_URL = process.env.SB_URL, SB_KEY = process.env.SB_SERVICE_KEY;
-const SITE = process.env.SITE || 'sydney';
+const SITE = (process.env.SITE || 'sydney').trim().toLowerCase();   // lowercase: the app queries site='sydney', so an env var set to 'SYDNEY' must not drift the stored value
 // How often to run the FULL sync (repairs/parts/notes/prune). Between those, only
 // kart status is refreshed, which is fast. Default 5 min; tune with HEAVY_INTERVAL_SEC.
 const HEAVY_INTERVAL_MS = Math.max(60000, (parseInt(process.env.HEAVY_INTERVAL_SEC, 10) || 300) * 1000);

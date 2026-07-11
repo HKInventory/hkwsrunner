@@ -109,7 +109,7 @@ async function notesSweeper(){
 const SCRIPT     = path.join(__dirname, 'racefacer-sync.js');
 const HEAVY_GAP  = Math.max(60,  parseInt(process.env.HEAVY_GAP_SEC     || '120', 10)) * 1000;
 const TIMEOUT_MS = Math.max(120, parseInt(process.env.CYCLE_TIMEOUT_SEC || '600', 10)) * 1000;
-const SITE       = process.env.SITE || 'sydney';
+const SITE       = (process.env.SITE || 'sydney').trim().toLowerCase();
 
 let stopping = false;
 function ts(){ return new Date().toISOString().replace('T', ' ').replace(/\..+/, ''); }
