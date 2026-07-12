@@ -28,7 +28,7 @@ const BASE    = (process.env.RIMO_BASE || 'http://wfm.rimo-germany.com').replace
 const USER    = process.env.RIMO_USER || '';
 const PASS    = process.env.RIMO_PASS || '';
 const POLL_MS = Math.max(1, parseInt(process.env.RIMO_POLL_SEC || '4', 10)) * 1000;
-let   KARTS_URL = process.env.RIMO_KARTS_URL || '';
+let   KARTS_URL = process.env.RIMO_KARTS_URL || `${BASE}/data/kartgrid.php`;   // confirmed live-grid feed
 
 // ---- tiny cookie jar (PHPSESSID) --------------------------------------------
 let jar = {};
@@ -60,23 +60,12 @@ async function rimoLogin(){
   console.log('[rimo] logged in');
 }
 
-let _discAt = 0;
-async function discoverKartsUrl(){
-  if (KARTS_URL) return KARTS_URL;
-  // Back off HARD when we can't find the feed — otherwise we refetch karts.php every poll (bandwidth).
-  if (Date.now() - _discAt < 60000) return '';
-  _discAt = Date.now();
-  const r = await fetch(`${BASE}/karts.php`, { headers: H({ Accept: 'text/html' }), redirect: 'manual' });
-  absorb(r);
-  const html = await r.text().catch(() => '');
-  if (/name=["']?password/i.test(html)) { loggedIn = false; return ''; }
-  // dhtmlxGrid data source: grid.load("x.php") / loadXML("x.php") / url:"x.php"
-  const m = html.match(/\.load(?:XML)?\s*\(\s*["']([^"']+\.php[^"']*)["']/i)
-         || html.match(/url\s*[:=]\s*["']([^"']+\.php[^"']*)["']/i)
-         || html.match(/["']([^"']*kart[^"']*\.php\?[^"']*)["']/i);
-  if (m) { KARTS_URL = new URL(m[1], `${BASE}/`).href; console.log('[rimo] karts feed:', KARTS_URL); return KARTS_URL; }
-  console.log('[rimo] could not find the karts data-feed URL — set RIMO_KARTS_URL to the Update List request URL (backing off 60s)');
-  return '';
+function feedUrl(){
+  // The browser hits the grid with a fresh ?e=<ms> cache-buster each time; do the same so no proxy
+  // or PHP session cache can hand us a stale grid. Strip any stale cache-buster from KARTS_URL first.
+  let u = KARTS_URL.replace(/([?&])e=\d+/i, '$1').replace(/[?&]+$/, '');
+  u = u.replace(/([?&])&+/g, '$1');
+  return u + (u.includes('?') ? '&' : '?') + 'e=' + Date.now();
 }
 
 function cellText(inner){
@@ -125,8 +114,7 @@ async function syncRimo(){
   if (!supa) { console.error('[rimo] missing Supabase env'); return; }
   try {
     if (!loggedIn) await rimoLogin();
-    const url = await discoverKartsUrl();
-    if (!url) return;   // no feed URL yet (backed off) — do NOT fetch the grid every second
+    const url = feedUrl();
     let xml = await fetchGrid(url);
     if (xml == null) { await rimoLogin(); xml = await fetchGrid(url); }   // session expired mid-poll → re-login once
     if (xml == null) { console.log('[rimo] could not read the grid (auth?)'); return; }
