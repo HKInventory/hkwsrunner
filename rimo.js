@@ -60,18 +60,23 @@ async function rimoLogin(){
   console.log('[rimo] logged in');
 }
 
+let _discAt = 0;
 async function discoverKartsUrl(){
   if (KARTS_URL) return KARTS_URL;
+  // Back off HARD when we can't find the feed — otherwise we refetch karts.php every poll (bandwidth).
+  if (Date.now() - _discAt < 60000) return '';
+  _discAt = Date.now();
   const r = await fetch(`${BASE}/karts.php`, { headers: H({ Accept: 'text/html' }), redirect: 'manual' });
   absorb(r);
   const html = await r.text().catch(() => '');
-  if (/name=["']?password/i.test(html)) { loggedIn = false; throw new Error('karts.php returned the login page — session not authed'); }
+  if (/name=["']?password/i.test(html)) { loggedIn = false; return ''; }
   // dhtmlxGrid data source: grid.load("x.php") / loadXML("x.php") / url:"x.php"
   const m = html.match(/\.load(?:XML)?\s*\(\s*["']([^"']+\.php[^"']*)["']/i)
          || html.match(/url\s*[:=]\s*["']([^"']+\.php[^"']*)["']/i)
          || html.match(/["']([^"']*kart[^"']*\.php\?[^"']*)["']/i);
   if (m) { KARTS_URL = new URL(m[1], `${BASE}/`).href; console.log('[rimo] karts feed:', KARTS_URL); return KARTS_URL; }
-  throw new Error('could not find the karts data-feed URL in karts.php — set RIMO_KARTS_URL to the Update List request URL');
+  console.log('[rimo] could not find the karts data-feed URL — set RIMO_KARTS_URL to the Update List request URL (backing off 60s)');
+  return '';
 }
 
 function cellText(inner){
@@ -121,6 +126,7 @@ async function syncRimo(){
   try {
     if (!loggedIn) await rimoLogin();
     const url = await discoverKartsUrl();
+    if (!url) return;   // no feed URL yet (backed off) — do NOT fetch the grid every second
     let xml = await fetchGrid(url);
     if (xml == null) { await rimoLogin(); xml = await fetchGrid(url); }   // session expired mid-poll → re-login once
     if (xml == null) { console.log('[rimo] could not read the grid (auth?)'); return; }
@@ -139,7 +145,7 @@ async function syncRimo(){
     const { error } = await supa.from('rimo_karts').upsert(changed, { onConflict: 'serial_no' });
     if (error) console.error('[rimo] upsert:', error.message);
     else console.log(`[rimo] ${changed.length} changed · ${rows.filter(x => x.online).length}/${rows.length} online`);
-  } catch (e) { console.error('[rimo]', e.message || e); loggedIn = false; }
+  } catch (e) { console.error('[rimo]', e.message || e); }   // auth resets happen explicitly; don't loop re-login here
 }
 
 function startRimo(){
