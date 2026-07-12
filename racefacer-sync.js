@@ -758,12 +758,13 @@ async function statusFast() {
   // status actually flipped this cycle. Re-writing all ~190 karts every cycle (even unchanged)
   // would fire a Supabase realtime message + egress per kart per cycle — on a ~10s always-on loop
   // that's millions of messages/day for no reason. Only changed rows broadcast; the rest are skipped.
-  const cur = new Map();
-  try { const f = (await sb('rf_karts?select=rf_id,status_code')) || []; for (const r of f) if (r.rf_id != null) cur.set(r.rf_id, r.status_code); }
+  const cur = new Map(), curType = new Map();
+  try { const f = (await sb('rf_karts?select=rf_id,status_code,type')) || []; for (const r of f) if (r.rf_id != null){ cur.set(r.rf_id, r.status_code); curType.set(r.rf_id, r.type); } }
   catch (e) { console.error(`[fast] couldn't read fleet: ${e.message}`); return 0; }
   if (!cur.size) return 0;                             // nothing known yet — the full sync will populate it
 
-  const lists = await Promise.all(Object.keys(KART_TYPES).map(async (uuid) => {
+  const uuids = Object.keys(KART_TYPES);
+  const lists = await Promise.all(uuids.map(async (uuid) => {
     try { const html = await (await rf(`/en/administration/garage/garage?kart_type_uuid=${uuid}`)).text(); return parseGarageStatuses(html); }
     catch (e) { return []; }                          // a page that fails this cycle just gets skipped; the next cycle/heavy covers it
   }));
@@ -771,13 +772,20 @@ async function statusFast() {
   const rows = [], seen = new Set(), now = new Date().toISOString();
   const noteFlags = new Set();   // karts the garage list shows as having an open note (if the parser exposes it)
   let scanned = 0;
-  for (const list of lists) for (const k of list) {
-    if (!k.rfId || k.statusCode == null || !cur.has(k.rfId) || seen.has(k.rfId)) continue;
-    seen.add(k.rfId); scanned++;
-    // parseGarageStatuses may expose a note indicator under any of these names; harmless if absent.
-    if (k.hasNote || k.hasNotes || k.noteActive || k.note || k.notes_count > 0) noteFlags.add(k.rfId);
-    if (cur.get(k.rfId) === k.statusCode) continue;   // unchanged — don't write, don't broadcast
-    rows.push({ rf_id: k.rfId, status: k.status, status_code: k.statusCode, fetched_at: now });
+  for (let _li = 0; _li < lists.length; _li++) {
+    const pageType = (KART_TYPES[uuids[_li]] && KART_TYPES[uuids[_li]].type) || null;   // the track type this page represents
+    for (const k of lists[_li]) {
+      if (!k.rfId || k.statusCode == null || !cur.has(k.rfId) || seen.has(k.rfId)) continue;
+      seen.add(k.rfId); scanned++;
+      // parseGarageStatuses may expose a note indicator under any of these names; harmless if absent.
+      if (k.hasNote || k.hasNotes || k.noteActive || k.note || k.notes_count > 0) noteFlags.add(k.rfId);
+      const statusChanged = cur.get(k.rfId) !== k.statusCode;
+      const typeChanged = pageType != null && curType.get(k.rfId) !== pageType;   // kart moved to another track type
+      if (!statusChanged && !typeChanged) continue;   // nothing changed this cycle: do not write, do not broadcast
+      const _row = { rf_id: k.rfId, status: k.status, status_code: k.statusCode, fetched_at: now };
+      if (pageType != null) _row.type = pageType;     // land the current track type in the same fast write
+      rows.push(_row);
+    }
   }
   for (let i = 0; i < rows.length; i += 100) {
     try { await sb('rf_karts?on_conflict=rf_id', { method: 'POST', prefer: 'resolution=merge-duplicates', body: rows.slice(i, i + 100) }); }
