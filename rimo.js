@@ -45,12 +45,12 @@ let _rimoSig = {};   // serial_no -> last state signature, so we only write kart
 async function rimoLogin(){
   jar = {};
   // 1) touch login.php so PHP hands us a session cookie
-  try { const r0 = await fetch(`${BASE}/login.php`, { headers: H({ Accept: 'text/html' }), redirect: 'manual' }); absorb(r0); } catch (e) {}
+  try { const r0 = await fetch(`${BASE}/login.php`, { headers: H({ Accept: 'text/html' }), redirect: 'manual', signal: AbortSignal.timeout(15000) }); absorb(r0); } catch (e) {}
   // 2) submit the codes
   const body = new URLSearchParams({ user: USER, password: PASS }).toString();
   const r = await fetch(`${BASE}/template/logincheck.php`, { method: 'POST',
     headers: H({ 'Content-type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest',
-      Origin: BASE, Referer: `${BASE}/login.php`, Accept: '*/*' }), body, redirect: 'manual' });
+      Origin: BASE, Referer: `${BASE}/login.php`, Accept: '*/*' }), body, redirect: 'manual', signal: AbortSignal.timeout(15000) });
   absorb(r);
   const txt = await r.text().catch(() => '');
   if (r.status >= 400 || /invalid|incorrect|fehler|denied|wrong/i.test(txt)) {
@@ -102,24 +102,31 @@ function parseRimoRows(xml){
 }
 
 async function fetchGrid(url){
-  const r = await fetch(url, { headers: H({ Accept: '*/*', 'X-Requested-With': 'XMLHttpRequest', Referer: `${BASE}/karts.php` }), redirect: 'manual' });
+  const r = await fetch(url, { headers: H({ Accept: '*/*', 'X-Requested-With': 'XMLHttpRequest', Referer: `${BASE}/karts.php` }), redirect: 'manual', signal: AbortSignal.timeout(15000) });
   absorb(r);
   const loc = r.headers.get('location') || '';
-  const xml = await r.text().catch(() => '');
-  if (r.status === 302 || /login\.php/i.test(loc) || /name=["']?password/i.test(xml)) { loggedIn = false; return null; }
-  return xml;
+  const body = await r.text().catch(() => '');
+  const authFail = (r.status === 302 || /login\.php/i.test(loc) || /name=["']?password/i.test(body));
+  if (authFail) loggedIn = false;
+  return { status: r.status, loc, body, authFail };
 }
 
+let _running = false;
 async function syncRimo(){
   if (!supa) { console.error('[rimo] missing Supabase env'); return; }
+  if (_running) return;   // CRITICAL: never overlap — concurrent polls share one cookie jar and clobber each other's login
+  _running = true;
   try {
     if (!loggedIn) await rimoLogin();
     const url = feedUrl();
-    let xml = await fetchGrid(url);
-    if (xml == null) { await rimoLogin(); xml = await fetchGrid(url); }   // session expired mid-poll → re-login once
-    if (xml == null) { console.log('[rimo] could not read the grid (auth?)'); return; }
-    const rows = parseRimoRows(xml);
-    if (!rows.length) { console.log('[rimo] no rows parsed — check RIMO_KARTS_URL / feed format'); return; }
+    let res = await fetchGrid(url);
+    if (res.authFail) { await rimoLogin(); res = await fetchGrid(url); }   // one clean retry after a fresh login
+    if (res.authFail) {
+      console.log(`[rimo] grid auth-fail (status ${res.status}${res.loc ? ' -> ' + res.loc : ''}) ${String(res.body).slice(0, 120).replace(/\s+/g, ' ')}`);
+      return;
+    }
+    const rows = parseRimoRows(res.body);
+    if (!rows.length) { console.log(`[rimo] 0 rows parsed (status ${res.status}, ${String(res.body).length} bytes) ${String(res.body).slice(0, 120).replace(/\s+/g, ' ')}`); return; }
     // Only write karts whose meaningful state changed since the last poll. At a 1s poll that means
     // ~0 writes most seconds and a handful when a kart flips online/off — the whole fleet is still
     // fully readable (unchanged rows keep their last value), we just avoid re-writing 200 rows/sec.
@@ -134,6 +141,7 @@ async function syncRimo(){
     if (error) console.error('[rimo] upsert:', error.message);
     else console.log(`[rimo] ${changed.length} changed · ${rows.filter(x => x.online).length}/${rows.length} online`);
   } catch (e) { console.error('[rimo]', e.message || e); }   // auth resets happen explicitly; don't loop re-login here
+  finally { _running = false; }
 }
 
 function startRimo(){
