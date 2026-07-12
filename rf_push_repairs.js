@@ -405,6 +405,45 @@ async function syncKartRecords(){
     else console.log(`[rf-push] kart records synced: ${rows.length}`);
   }catch(e){ console.error('[rf-push] kart records:', e.message || e); }
 }
+/* Pull the dropdown option lists (safety servers, kart types) off the Settings->Karts page — the
+   same page we fetch for the save token — so the app's Admin dropdowns are labelled and stay current
+   with zero maintenance. Stored under the synthetic rf_kart_admin row rf_kart_id=0 (no real kart has
+   id 0), so the app reads one row for all lookups. Falls back gracefully if the markup ever changes. */
+function parseSelectOptions(html, selectId){
+  const block = html.match(new RegExp('<select[^>]*\\bid=["\']' + selectId + '["\'][^>]*>([\\s\\S]*?)<\\/select>', 'i'));
+  if (!block) return [];
+  const out = [];
+  const optRe = /<option[^>]*\bvalue=["']([^"']*)["'][^>]*>([\s\S]*?)<\/option>/gi;
+  let m;
+  while ((m = optRe.exec(block[1]))){
+    const val = m[1].trim();
+    const name = m[2].replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
+    if (val !== '' && name) out.push([/^-?\d+$/.test(val) ? Number(val) : val, name]);
+  }
+  return out;
+}
+async function syncKartLookups(){
+  try{
+    if (!loggedIn) await rfLogin();
+    const url = `${RF_BASE}/en/administration/settings/karts`;
+    const r = await fetch(url, { agent, headers: rfHeaders({ Referer: url }), redirect:'manual' });
+    absorb(r);
+    if (r.status === 302 || /login/i.test(r.headers.get('location')||'')) { loggedIn = false; throw new Error('session expired'); }
+    const html = await r.text();
+    const safety_servers = parseSelectOptions(html, 'safety_server_id');
+    const kart_types = parseSelectOptions(html, 'kart_type_id');
+    const fields = {};
+    if (safety_servers.length) fields.safety_servers = safety_servers;
+    if (kart_types.length) fields.kart_types = kart_types;
+    if (!Object.keys(fields).length){
+      await rfDebug('edit_kart', 0, 'lookups: no <select> options parsed from settings/karts', html.slice(0, 600));
+      console.log('[rf-push] lookups: none parsed (dropdowns may be JS-rendered)'); return;
+    }
+    const { error } = await supa.from('rf_kart_admin').upsert([{ rf_kart_id: 0, fields, updated_at: new Date().toISOString() }], { onConflict:'rf_kart_id' });
+    if (error) console.error('[rf-push] lookups upsert:', error.message);
+    else console.log(`[rf-push] lookups synced: ${safety_servers.length} safety servers, ${kart_types.length} types`);
+  }catch(e){ console.error('[rf-push] lookups:', e.message || e); }
+}
 async function editKartToken(){
   const url = `${RF_BASE}/en/administration/settings/karts`;
   const r = await fetch(url, { agent, headers: rfHeaders({ Referer: url }), redirect:'manual' });
@@ -587,5 +626,7 @@ function startRepairPusher(scrape){
   setInterval(syncWarehouse, 6 * 60 * 60 * 1000);   // refresh the parts list every 6h
   syncKartRecords();
   setInterval(syncKartRecords, 10 * 60 * 1000);      // mirror kart records for the Admin form every 10 min
+  syncKartLookups();
+  setInterval(syncKartLookups, 10 * 60 * 1000);      // keep the safety-server / type dropdown labels current
 }
 module.exports = { startRepairPusher, rfLogin, dumpDamagePage, discoverPartsAjax, parseParts, _rowsFromAjax };
