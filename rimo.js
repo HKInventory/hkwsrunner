@@ -27,7 +27,7 @@ const supa = (SB_URL && SB_KEY) ? createClient(SB_URL, SB_KEY, { auth: { persist
 const BASE    = (process.env.RIMO_BASE || 'http://wfm.rimo-germany.com').replace(/\/+$/, '');
 const USER    = process.env.RIMO_USER || '';
 const PASS    = process.env.RIMO_PASS || '';
-const POLL_MS = Math.max(2, parseInt(process.env.RIMO_POLL_SEC || '4', 10)) * 1000;
+const POLL_MS = Math.max(1, parseInt(process.env.RIMO_POLL_SEC || '4', 10)) * 1000;
 let   KARTS_URL = process.env.RIMO_KARTS_URL || '';
 
 // ---- tiny cookie jar (PHPSESSID) --------------------------------------------
@@ -40,6 +40,7 @@ function cookieHeader(){ return Object.keys(jar).map(k => `${k}=${jar[k]}`).join
 function H(extra = {}){ return { Cookie: cookieHeader(), 'User-Agent': 'HKWorkshopBot/1.0', ...extra }; }
 
 let loggedIn = false;
+let _rimoSig = {};   // serial_no -> last state signature, so we only write karts that changed
 
 async function rimoLogin(){
   jar = {};
@@ -125,11 +126,19 @@ async function syncRimo(){
     if (xml == null) { console.log('[rimo] could not read the grid (auth?)'); return; }
     const rows = parseRimoRows(xml);
     if (!rows.length) { console.log('[rimo] no rows parsed — check RIMO_KARTS_URL / feed format'); return; }
+    // Only write karts whose meaningful state changed since the last poll. At a 1s poll that means
+    // ~0 writes most seconds and a handful when a kart flips online/off — the whole fleet is still
+    // fully readable (unchanged rows keep their last value), we just avoid re-writing 200 rows/sec.
     const now = new Date().toISOString();
-    const up = rows.map(x => ({ ...x, updated_at: now }));
-    const { error } = await supa.from('rimo_karts').upsert(up, { onConflict: 'serial_no' });
+    const changed = [];
+    for (const x of rows){
+      const sig = [x.online ? 1 : 0, x.bms_ok ? 1 : 0, x.soc, x.last_online, x.hours, x.preset, x.speedset, x.group_name, x.kart_no].join('|');
+      if (_rimoSig[x.serial_no] !== sig){ _rimoSig[x.serial_no] = sig; changed.push({ ...x, updated_at: now }); }
+    }
+    if (!changed.length) return;   // nothing changed — skip the write entirely
+    const { error } = await supa.from('rimo_karts').upsert(changed, { onConflict: 'serial_no' });
     if (error) console.error('[rimo] upsert:', error.message);
-    else console.log(`[rimo] synced ${up.length} karts · ${up.filter(x => x.online).length} online`);
+    else console.log(`[rimo] ${changed.length} changed · ${rows.filter(x => x.online).length}/${rows.length} online`);
   } catch (e) { console.error('[rimo]', e.message || e); loggedIn = false; }
 }
 
