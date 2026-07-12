@@ -350,6 +350,125 @@ async function rfCreateStatus(row){
 
 /* ---------------- queue drain (locked so realtime + poll never overlap) ---------------- */
 let draining = false;
+/* ---- kart admin edits (track type / safety server / status) --------------------------------
+   The app queues a change with only the fields to change (null = leave alone). RaceFacer's edit
+   form REPLACES the whole row, so we read the kart's current record first (karts-info), overlay the
+   requested changes, and re-submit every field — otherwise unspecified fields get blanked. */
+/* One karts-info call returns the WHOLE fleet (each kart's full record), grouped by type.
+   We fetch it once, cache briefly, and reuse it for both the per-kart read and the sync into
+   rf_kart_admin (which the app reads to pre-fill the Admin form). The exact path isn't 100%
+   confirmed from the capture, so we try the likely candidates and log the raw body on failure:
+     select payload from rf_debug where kind='edit_kart' order by id desc limit 1; */
+let _kartsInfoCache = { at: 0, records: [] };
+async function fetchKartsInfo(force){
+  if (!force && Date.now() - _kartsInfoCache.at < 30000 && _kartsInfoCache.records.length) return _kartsInfoCache.records;
+  const sample = Number(process.env.RF_SAMPLE_KART) || 26;
+  const paths = ['/ajax/kart/karts-info', '/ajax/garage/karts-info'];
+  let lastText = '';
+  for (const p of paths){
+    try {
+      const url = `${RF_BASE}${p}?kart_id=${sample}`;
+      const r = await fetch(url, { agent, headers: rfHeaders({ Accept:'application/json', Referer:`${RF_BASE}/en/administration/settings/karts` }), redirect:'manual' });
+      absorb(r);
+      if (r.status === 302 || /login/i.test(r.headers.get('location')||'')) { loggedIn = false; throw new Error('session expired'); }
+      if (r.status >= 400) continue;
+      lastText = await r.text();
+      let j; try { j = JSON.parse(lastText); } catch { continue; }
+      const groups = (j && (j.kart_names || j.karts || j.karts_info)) || {};
+      const recs = [];
+      for (const k in groups){ const arr = groups[k]; if (Array.isArray(arr)) for (const x of arr){ if (x && x.id != null) recs.push(x); } }
+      if (recs.length){ _kartsInfoCache = { at: Date.now(), records: recs }; return recs; }
+    } catch(e){ if (/session expired/.test(e.message||'')) throw e; }
+  }
+  await rfDebug('edit_kart', 0, 'karts-info: could not parse fleet / unexpected path', lastText || '(no response)');
+  return [];
+}
+async function fetchKartRecord(kartId){
+  const recs = await fetchKartsInfo();
+  const hit = recs.find(x => Number(x.id) === Number(kartId));
+  if (hit) return hit;
+  await rfDebug('edit_kart', kartId, 'karts-info: kart not found in fleet', recs.length ? JSON.stringify(recs[0]).slice(0,300) : '(empty)');
+  throw new Error(`karts-info: could not load current record for kart ${kartId}`);
+}
+/* Mirror every kart's current full record into rf_kart_admin so the app can pre-fill the Admin
+   form (transponder, tyre size, chassis, price, etc.). Admin fields change rarely, so a periodic
+   refresh + a re-sync right after each successful edit keeps the app current enough. */
+async function syncKartRecords(){
+  try{
+    if (!loggedIn) await rfLogin();
+    const recs = await fetchKartsInfo(true);
+    if (!recs.length){ console.log("[rf-push] kart records: none parsed -> select payload from rf_debug where kind='edit_kart' order by id desc limit 1;"); return; }
+    const now = new Date().toISOString();
+    const rows = recs.map(x => ({ rf_kart_id: Number(x.id), fields: x, updated_at: now }));
+    const { error } = await supa.from('rf_kart_admin').upsert(rows, { onConflict:'rf_kart_id' });
+    if (error) console.error('[rf-push] kart records upsert:', error.message);
+    else console.log(`[rf-push] kart records synced: ${rows.length}`);
+  }catch(e){ console.error('[rf-push] kart records:', e.message || e); }
+}
+async function editKartToken(){
+  const url = `${RF_BASE}/en/administration/settings/karts`;
+  const r = await fetch(url, { agent, headers: rfHeaders({ Referer: url }), redirect:'manual' });
+  absorb(r);
+  if (r.status === 302 || /login/i.test(r.headers.get('location')||'')) { loggedIn = false; throw new Error('session expired'); }
+  const html = await r.text();
+  return html.match(/name="_token"[^>]*value="([^"]+)"/)?.[1] || html.match(/csrf-token"[^>]*content="([^"]+)"/)?.[1] || '';
+}
+async function rfEditKart(row){
+  const token = await editKartToken();
+  let f;
+  if (row.payload && typeof row.payload === 'object' && Object.keys(row.payload).length){
+    // NEW path: the app already built the COMPLETE record (every field, edits applied) from the
+    // mirrored rf_kart_admin values, so we post it as-is — no fragile per-save read.
+    f = { ...row.payload };
+  } else {
+    // LEGACY path: a partial queue row — read the current record and overlay only the changed fields
+    // (RaceFacer's edit replaces the whole row, so unspecified fields must be re-sent unchanged).
+    const rec = await fetchKartRecord(row.rf_kart_id);
+    const keep = (v, cur) => (v == null || v === '') ? cur : v;
+    f = {
+      name: rec.name, kart_type_id: keep(row.kart_type_id, rec.kart_type_id), transponder: rec.transponder,
+      is_active: keep(row.is_active, rec.is_active), fleet_management_id: rec.fleet_management_id,
+      tyre_size: rec.tyre_size, safety_server_id: keep(row.safety_server_id, rec.safety_server_id),
+      dehaart_kart_number: rec.dehaart_kart_number, start_exploitation_date: rec.start_exploitation_date,
+      start_exploitation_km: rec.start_exploitation_km, start_exploitation_laps: rec.start_exploitation_laps,
+      start_exploitation_hours: rec.start_exploitation_hours, chassis_number: rec.chassis_number,
+      engine_number: rec.engine_number, price: rec.price, kart_acquire_condition_id: rec.kart_acquire_condition_id,
+      kart_status_id: keep(row.kart_status_id, rec.kart_status_id)
+    };
+  }
+  const S = v => (v == null ? '' : String(v));
+  const body = new URLSearchParams({
+    name: S(f.name),
+    kart_type_id: S(f.kart_type_id),
+    transponder: S(f.transponder),
+    is_active: S(Number(f.is_active) ? 1 : 0),
+    fleet_management_id: S(f.fleet_management_id),
+    tyre_size: S(f.tyre_size == null ? 0 : f.tyre_size),
+    safety_server_id: S(f.safety_server_id),
+    dehaart_kart_number: S(f.dehaart_kart_number),
+    start_exploitation_date: S(f.start_exploitation_date).slice(0, 10),   // "2021-11-08 00:00:00" -> "2021-11-08"
+    start_exploitation_km: S(f.start_exploitation_km == null ? 0 : f.start_exploitation_km),
+    start_exploitation_laps: S(f.start_exploitation_laps == null ? 0 : f.start_exploitation_laps),
+    start_exploitation_hours: S(f.start_exploitation_hours == null ? 0 : f.start_exploitation_hours),
+    chassis_number: S(f.chassis_number),
+    engine_number: S(f.engine_number),
+    price: S(f.price == null ? 0 : f.price),
+    kart_acquire_condition_id: S(f.kart_acquire_condition_id == null ? 1 : f.kart_acquire_condition_id),
+    kart_status_id: S(f.kart_status_id),
+    _token: token,
+    kart_id: S(row.rf_kart_id),
+    kart_type_match: ''
+  });
+  const r = await fetch(`${RF_BASE}/ajax/kart/edit-kart`, { method:'POST', agent, redirect:'manual',
+    headers: rfHeaders({ 'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8', 'X-CSRF-Token':token,
+      Referer:`${RF_BASE}/en/administration/settings/karts` }), body });
+  absorb(r);
+  if (r.status===401 || /login/i.test(r.headers.get('location')||'')) { loggedIn=false; throw new Error('session expired'); }
+  const { txt, j } = await rfBody(r);
+  const fail = rfFailure(r.status, txt, j);
+  if (fail){ await rfDebug('edit_kart', row.rf_kart_id, `edit-kart refused: ${fail}`, txt); throw new Error(`edit-kart: ${fail}`); }
+  try { await syncKartRecords(); } catch {}   // reflect the new values back into rf_kart_admin for the app
+}
 async function drainTable(table, submit, scrape){
   const { data: rows, error } = await supa.from(table).select('*').eq('status','pending').order('id',{ascending:true}).limit(10);
   if (error) { console.error(`[rf-push] read ${table}:`, error.message); return; }
@@ -373,7 +492,7 @@ async function drainTable(table, submit, scrape){
 }
 async function drainAll(scrape){
   if (draining) return; draining = true;
-  try { await drainTable('rf_repair_queue', rfCreateDamage, scrape); await drainTable('rf_note_queue', rfCreateNote, scrape); await drainTable('rf_status_queue', rfCreateStatus, scrape); }
+  try { await drainTable('rf_repair_queue', rfCreateDamage, scrape); await drainTable('rf_note_queue', rfCreateNote, scrape); await drainTable('rf_status_queue', rfCreateStatus, scrape); await drainTable('rf_kart_edit_queue', rfEditKart); }
   finally { draining = false; }
 }
 
@@ -457,6 +576,7 @@ function startRepairPusher(scrape){
     .on('postgres_changes', { event:'INSERT', schema:'public', table:'rf_repair_queue' }, () => drainAll(scrape))
     .on('postgres_changes', { event:'INSERT', schema:'public', table:'rf_note_queue'   }, () => drainAll(scrape))
     .on('postgres_changes', { event:'INSERT', schema:'public', table:'rf_status_queue' }, () => drainAll(scrape))
+    .on('postgres_changes', { event:'INSERT', schema:'public', table:'rf_kart_edit_queue' }, () => drainAll(scrape))
     .subscribe((status) => console.log('[rf-push] realtime:', status));
   // 2) catch anything queued while we were down, right now
   drainAll(scrape);
@@ -465,5 +585,7 @@ function startRepairPusher(scrape){
   setInterval(keepWarm, 4 * 60 * 1000);
   syncWarehouse();
   setInterval(syncWarehouse, 6 * 60 * 60 * 1000);   // refresh the parts list every 6h
+  syncKartRecords();
+  setInterval(syncKartRecords, 10 * 60 * 1000);      // mirror kart records for the Admin form every 10 min
 }
 module.exports = { startRepairPusher, rfLogin, dumpDamagePage, discoverPartsAjax, parseParts, _rowsFromAjax };
