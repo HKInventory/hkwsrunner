@@ -377,30 +377,75 @@ async function drainAll(scrape){
   finally { draining = false; }
 }
 
-async function syncWarehouse(){ // publish RaceFacer's parts list so the app dropdown uses REAL ids
+/* ---- warehouse: RaceFacer's REAL parts stock -------------------------------------------
+   The Add-damage form's parts picker is a lazy Select2 (its <option>s aren't in the server
+   HTML, they load by AJAX after a kart is chosen), so scraping that page never yielded parts.
+   The Warehouse page (/en/administration/garage/warehouse) is a plain server-rendered table
+   of every part: the part id is on each row (<tr data-id="N">, same id RaceFacer's own
+   show_edit_item/history actions use) and the live stock is the Quantity column. That is the
+   real source the app dropdown lists. Columns: Name | Ref | Catalog | Quantity | Supplier | ... */
+function parseWarehouse(html){
+  const strip = s => String(s || '').replace(/<[^>]*>/g, '').replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
+    .replace(/&#0?39;|&apos;/gi, "'").replace(/\s+/g, ' ').trim();
+  // Scope to the inventory tbody so the add/edit popups' own tables can't leak in.
+  const bodyM = html.match(/<tbody[^>]*id=["']warehouse-items-list["'][^>]*>([\s\S]*?)<\/tbody>/i);
+  const body = bodyM ? bodyM[1] : html;
+  const rows = [], seen = new Set();
+  const reTr = /<tr[^>]*\bdata-id=["'](\d+)["'][^>]*>([\s\S]*?)<\/tr>/gi;
+  let m;
+  while ((m = reTr.exec(body))){
+    const partId = Number(m[1]);
+    if (!Number.isFinite(partId) || seen.has(partId)) continue;
+    const cells = []; const reTd = /<td\b[^>]*>([\s\S]*?)<\/td>/gi; let c;
+    while ((c = reTd.exec(m[2]))) cells.push(c[1]);
+    if (cells.length < 4) continue;                       // need at least Name..Quantity
+    const name = strip(cells[0]);
+    const qty  = parseInt(strip(cells[3]).replace(/[^\d-]/g, ''), 10);   // Quantity col = live stock
+    if (!name) continue;
+    seen.add(partId);
+    // price isn't on the list page (it's entered per-repair in the app), so default 0.
+    rows.push({ part_id: partId, rf_id: partId, name, price: 0,
+      max_qty: Number.isFinite(qty) ? qty : 0, updated_at: new Date().toISOString() });
+  }
+  return rows;
+}
+async function fetchWarehouseParts(){
+  const url = `${RF_BASE}/en/administration/garage/warehouse`;
+  const r = await fetch(url, { agent, headers: rfHeaders({ Referer: url }), redirect: 'manual' });
+  absorb(r);
+  if (r.status === 302 || /login/i.test(r.headers.get('location') || '')) { loggedIn = false; throw new Error('session expired'); }
+  const html = await r.text();
+  return { rows: parseWarehouse(html), html };
+}
+async function syncWarehouse(){ // publish RaceFacer's warehouse stock so the app dropdown uses REAL part ids
   try{
     if (!loggedIn) await rfLogin();
-    // A kart with no open damage can render an empty form, so try a few before giving up.
-    const karts = [Number(process.env.RF_SAMPLE_KART) || 26, 13, 15, 39];
-    let rows = [];
-    for (const kartId of karts){
-      const ctx = await formContext(kartId);
-      rows = Object.values(ctx.parts).filter(p => p.part_id).map(p => ({
-        part_id:p.part_id, rf_id:p.id, name:p.name||'', price:p.price||0,
-        max_qty:p.max_qty||99, updated_at:new Date().toISOString() }));
-      if (rows.length > 1){ console.log(`[rf-push] warehouse: ${rows.length} parts from kart ${kartId}`); break; }
+    let rows = [], whHtml = '';
+    // PRIMARY: the server-rendered Warehouse page — real part ids + live stock.
+    try { const w = await fetchWarehouseParts(); rows = w.rows; whHtml = w.html; }
+    catch(e){ console.error('[rf-push] warehouse page fetch failed:', e.message || e); }
+    if (rows.length){
+      console.log(`[rf-push] warehouse: ${rows.length} parts from warehouse page`);
+    } else {
+      // FALLBACK: the old Add-damage form scrape, in case the warehouse markup ever changes.
+      const karts = [Number(process.env.RF_SAMPLE_KART) || 26, 13, 15, 39];
+      for (const kartId of karts){
+        const ctx = await formContext(kartId);
+        rows = Object.values(ctx.parts).filter(p => p.part_id).map(p => ({
+          part_id:p.part_id, rf_id:p.id, name:p.name||'', price:p.price||0,
+          max_qty:p.max_qty||99, updated_at:new Date().toISOString() }));
+        if (rows.length > 1){ console.log(`[rf-push] warehouse: ${rows.length} parts from damage form (fallback), kart ${kartId}`); break; }
+      }
     }
-    if (rows.length < 2){
-      // A Background Worker has no public URL, so stash the page in Supabase instead:
-      //   select payload from rf_debug where kind='damage_html' order by id desc limit 1;
-      const kartId = karts[0];
-      const ctx = await formContext(kartId);
-      await rfDebug('damage_html', kartId,
-        `parts parsed: ${rows.length}. select2 endpoints seen: ${discoverPartsAjax(ctx.html).join(' | ') || 'none'}`,
-        ctx.html);
-      console.log('[rf-push] warehouse: no parts. Page captured -> select payload from rf_debug order by id desc limit 1;');
-      if (!rows.length) return;
+    if (rows.length < 1){
+      // Stash the warehouse page so we can see why it didn't parse:
+      //   select payload from rf_debug where kind='warehouse_html' order by id desc limit 1;
+      await rfDebug('warehouse_html', 0, 'warehouse page — parts parsed: 0', whHtml || '(fetch failed)');
+      console.log("[rf-push] warehouse: no parts. Page captured -> select payload from rf_debug where kind='warehouse_html' order by id desc limit 1;");
+      return;
     }
+    // Upsert the full list; part_id is the unique key the app selects on.
     const { error } = await supa.from('rf_warehouse').upsert(rows, { onConflict:'part_id' });
     if (error) console.error('[rf-push] warehouse upsert:', error.message);
     else console.log(`[rf-push] warehouse synced: ${rows.length} parts`);
