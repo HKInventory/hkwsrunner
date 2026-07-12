@@ -332,7 +332,7 @@ async function enumerateKarts() {
   // Returns a Map of rf_id -> { site, type } so each kart is tagged by the page it came from.
   const map = new Map();
   if (process.env.RF_KART_IDS) {
-    for (const s of process.env.RF_KART_IDS.split(',')) { const n = +s.trim(); if (n) map.set(n, { site: process.env.SITE || 'sydney', type: null }); }
+    for (const s of process.env.RF_KART_IDS.split(',')) { const n = +s.trim(); if (n) map.set(n, { site: SITE, type: null }); }
     return map;
   }
   for (const [uuid, meta] of Object.entries(KART_TYPES)) {
@@ -682,7 +682,7 @@ async function pruneStale(activeIds) {
 // every ~30s without fetching all 211 every cycle.
 let _noteCursor = 0;
 async function notesFast(garageFlags) {
-  const site = process.env.SITE || 'sydney';
+  const site = SITE;   // lowercased module const (see line ~18) — never the raw env, or notes get written under 'SYDNEY' and the app's site='sydney' query can't see them
 
   // The fleet's kart ids (from rf_karts). This is what we rotate through.
   let fleet = [];
@@ -728,7 +728,7 @@ async function notesFast(garageFlags) {
    when a note actually changed, so a quiet sweep costs zero realtime messages.
    Aborts if a third of requests error (RaceFacer struggling) — the next sweep retries. */
 async function sweepNotesAll({ concurrency = 8 } = {}) {
-  const site = process.env.SITE || 'sydney';
+  const site = SITE;   // lowercased module const (see line ~18) — never the raw env, or notes get written under 'SYDNEY' and the app's site='sydney' query can't see them
   const fleet = ((await sb('rf_karts?select=rf_id&order=rf_id')) || []).map((r) => r.rf_id).filter((x) => x != null);
   if (!fleet.length) return 0;
   let i = 0, touched = 0, errors = 0;
