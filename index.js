@@ -40,6 +40,9 @@ const path = require('path');
 const { startRepairPusher } = require('./rf_push_repairs');
 startRepairPusher(/* scrapeKartRepairs */);   // optional: pass a per-kart re-scrape fn if you have one
 
+// ---- 1b. RiMO Germany WFM poller (live online / SOC / BMS per kart) --------
+try { require('./rimo').startRimo(); } catch (e) { console.error('[rimo] failed to start:', e.message || e); }
+
 // ---- PERSISTENT STATUS POLLER (in-process, no re-spawn/re-login) -----------
 // Status changes must feel instant. Spawning a fresh racefacer-sync.js each cycle re-logs into
 // RaceFacer (~1-2s handshake) EVERY time, which caps how fast we can go. So status runs here,
