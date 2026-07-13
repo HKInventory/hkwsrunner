@@ -50,8 +50,8 @@ try { require('./rimo').startRimo(); } catch (e) { console.error('[rimo] failed 
 // karts whose status flipped. ~5 requests/cycle is well within what RaceFacer tolerates.
 const sync = require('./racefacer-sync');
 const STATUS_POLL = Math.max(2, parseInt(process.env.STATUS_POLL_SEC   || '2', 10)) * 1000;
-const NOTES_CONC  = Math.max(2, Math.min(12, parseInt(process.env.NOTES_CONCURRENCY || '8', 10)));
-const NOTES_PAUSE = Math.max(1, parseInt(process.env.NOTES_GAP_SEC     || '2', 10)) * 1000;
+const NOTES_CONC  = Math.max(2, Math.min(12, parseInt(process.env.NOTES_CONCURRENCY || '10', 10)));
+const NOTES_PAUSE = Math.max(1, parseInt(process.env.NOTES_GAP_SEC     || '1', 10)) * 1000;
 
 // ONE login shared by the status poller and the notes sweeper (same module = same cookie jar).
 // The promise-guard stops both loops logging in at the same moment; an auth error resets it so
