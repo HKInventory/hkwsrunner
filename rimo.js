@@ -31,11 +31,10 @@ const PASS    = (process.env.RIMO_PASS || '').trim();
 const POLL_MS = Math.max(1, parseInt(process.env.RIMO_POLL_SEC || '4', 10)) * 1000;
 let   KARTS_URL = process.env.RIMO_KARTS_URL || `${BASE}/data/kartgrid.php`;   // confirmed live-grid feed
 
-// RiMO's login page MD5-hashes the password in the browser before POSTing it, so we send md5(password).
-// If someone stored the already-hashed 32-char value in RIMO_PASS, use it as-is.
-function passwordField(){
-  return /^[a-f0-9]{32}$/i.test(PASS) ? PASS.toLowerCase() : crypto.createHash('md5').update(PASS, 'utf8').digest('hex');
-}
+// RiMO's login page hashes the password as md5(md5(password) + PHPSESSID) — the session id is a
+// per-login salt baked into the page. So we fetch login.php for the session, then hash the same way.
+function md5hex(s){ return crypto.createHash('md5').update(String(s), 'utf8').digest('hex'); }
+function cryptPass(rawPass, sid){ return md5hex(md5hex(rawPass) + sid); }
 
 // ---- tiny cookie jar (PHPSESSID) --------------------------------------------
 let jar = {};
@@ -52,27 +51,24 @@ let _rimoSig = {};   // serial_no -> last state signature, so we only write kart
 
 async function rimoLogin(){
   jar = {};
-  // 1) touch login.php so PHP hands us a session cookie
-  try { const r0 = await fetch(`${BASE}/login.php`, { headers: H({ Accept: 'text/html' }), redirect: 'manual', signal: AbortSignal.timeout(15000) }); absorb(r0); } catch (e) {}
-  // 2) submit the codes
-  const body = new URLSearchParams({ user: USER, password: passwordField() }).toString();
+  // 1) load login.php → gives us the session cookie AND the page bakes the hash salt into crypt():
+  //    crypt(str){ return md5(md5(str)+"<salt>"); }  — the salt is the session id in practice, but we
+  //    read it straight from the page so we always hash with the exact value the browser would use.
+  let html = '';
+  try { const r0 = await fetch(`${BASE}/login.php`, { headers: H({ Accept: 'text/html' }), redirect: 'manual', signal: AbortSignal.timeout(15000) }); absorb(r0); html = await r0.text().catch(() => ''); } catch (e) {}
+  const m = html.match(/md5\s*\(\s*md5\s*\([^)]*\)\s*\+\s*"([^"]+)"/i);
+  const salt = (m && m[1]) || jar.PHPSESSID || '';
+  if (!salt) { loggedIn = false; console.log('[rimo] login: could not read the hash salt from login.php'); throw new Error('no salt'); }
+  // 2) submit user + md5(md5(password) + salt), exactly like the login page's crypt()
+  const body = new URLSearchParams({ user: USER, password: cryptPass(PASS, salt) }).toString();
   const r = await fetch(`${BASE}/template/logincheck.php`, { method: 'POST',
     headers: H({ 'Content-type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest',
       Origin: BASE, Referer: `${BASE}/login.php`, Accept: '*/*' }), body, redirect: 'manual', signal: AbortSignal.timeout(15000) });
   absorb(r);
-  const txt = await r.text().catch(() => '');
-  // 3) establish + VERIFY the session by loading karts.php (the page that hosts the grid). Some PHP
-  //    setups only finalise the authed session once you land on a real page after logincheck, and this
-  //    also tells us definitively whether the credentials were accepted.
-  let vloc = '', vstatus = 0, vbody = '';
-  try {
-    const v = await fetch(`${BASE}/karts.php`, { headers: H({ Accept: 'text/html', Referer: `${BASE}/login.php` }), redirect: 'manual', signal: AbortSignal.timeout(15000) });
-    absorb(v); vstatus = v.status; vloc = v.headers.get('location') || ''; vbody = await v.text().catch(() => '');
-  } catch (e) {}
-  const ok = !(vstatus === 302 && /login\.php/i.test(vloc)) && !/<input[^>]*name=["']?password/i.test(vbody) && vstatus < 400;
-  if (!ok) {
+  const txt = (await r.text().catch(() => '')).trim();
+  if (txt !== 'ok') {   // the login page treats any response other than "ok" as failure
     loggedIn = false;
-    console.log(`[rimo] login NOT accepted — sent user='${USER}' pass=${passwordField().slice(0, 6)}…(${passwordField().length}) · logincheck(${r.status}) "${String(txt).slice(0, 60).replace(/\s+/g, ' ')}" · karts.php(${vstatus}${vloc ? ' -> ' + vloc : ''}) · cookies: ${Object.keys(jar).join(',') || 'NONE'}`);
+    console.log(`[rimo] login NOT accepted — sent user='${USER}' · logincheck(${r.status}) "${txt.slice(0, 60).replace(/\s+/g, ' ')}" · cookies: ${Object.keys(jar).join(',') || 'NONE'} — RIMO_PASS must be your PLAIN password now (not a hash)`);
     throw new Error('login not accepted');
   }
   loggedIn = true;
