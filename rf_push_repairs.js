@@ -253,9 +253,17 @@ function resolveUser(name, users){
   return null;
 }
 function resolvePart(p, parts){
-  if (p.part_id) return { part_id:Number(p.part_id), id:Number(p.id||p.part_id), max_qty:Number(p.max_qty||99), price:(p.price!=null?Number(p.price):0) }; // exact ids from the synced warehouse
-  const byName = parts[norm(p.name)]; if (byName) return byName;
-  for (const k in parts) if (p.name && (k.includes(norm(p.name)) || norm(p.name).includes(k))) return parts[k];
+  // The damage form's OWN Select2 list (fetched live via AJAX into `parts`) holds the warehouse-stock
+  // ids RaceFacer actually looks up. Always resolve to one of those so we can never send an id that
+  // doesn't exist — which is what made RaceFacer crash ("get property 'name' of non-object") and reject
+  // the whole repair. The app-supplied id (from a separate warehouse sync) is only trusted if it's
+  // present in this live list; otherwise the part is dropped so the repair still goes through.
+  if (p.name){
+    const byName = parts[norm(p.name)]; if (byName) return byName;
+    for (const k in parts) if (k.includes(norm(p.name)) || norm(p.name).includes(k)) return parts[k];
+  }
+  const want = Number(p.id != null ? p.id : p.part_id);
+  if (Number.isFinite(want)) for (const k in parts){ const r = parts[k]; if (r && (r.id === want || r.part_id === want)) return r; }
   return null;
 }
 
@@ -314,10 +322,18 @@ async function rfCreateDamage(row){
     kart_status_id:String(RF_STATUS_ID[row.rf_status]||1), user_id:String(user_id), annotation:row.note||'',
     repair_km:String(row.repair_km||0), _token:ctx.token }).toString();
   const body = new URLSearchParams(); body.set('damage', inner);
-  (row.parts||[]).forEach((p,i)=>{ const rp = resolvePart(p, ctx.parts); if(!rp) return;
-    body.append(`used_parts[${i}][id]`, String(rp.id)); body.append(`used_parts[${i}][price]`, String(p.price!=null?p.price:rp.price));
-    body.append(`used_parts[${i}][qty]`, String(p.qty||1)); body.append(`used_parts[${i}][part_id]`, String(rp.part_id));
-    body.append(`used_parts[${i}][max_qty]`, String(rp.max_qty||99)); });
+  let pi = 0, dropped = 0;
+  for (const p of (row.parts || [])){
+    const rp = resolvePart(p, ctx.parts);
+    if (!rp){ dropped++; console.log(`[rf-push] repair #${row.id}: part "${p.name || p.sku || '?'}" not in RaceFacer's parts list — sending repair without it`); continue; }
+    body.append(`used_parts[${pi}][id]`, String(rp.id));
+    body.append(`used_parts[${pi}][price]`, String(p.price != null ? p.price : rp.price));
+    body.append(`used_parts[${pi}][qty]`, String(p.qty || 1));
+    body.append(`used_parts[${pi}][part_id]`, String(rp.part_id));
+    body.append(`used_parts[${pi}][max_qty]`, String(rp.max_qty || 99));
+    pi++;
+  }
+  if (dropped && (row.parts || []).length && Object.keys(ctx.parts || {}).length === 0) console.log(`[rf-push] repair #${row.id}: damage-form parts list came back empty — all parts dropped (check the Select2 AJAX)`);
   const r = await fetch(`${RF_BASE}/ajax/garage/damage`, { method:'POST', agent, redirect:'manual',
     headers: rfHeaders({ 'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8', 'X-CSRF-Token':ctx.token,
       Referer:`${RF_BASE}/en/administration/garage/damage?kart_id=${row.rf_kart_id}&referer=repairs` }), body });
