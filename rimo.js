@@ -160,11 +160,17 @@ async function fetchKartBms(id){
   if (!_bmsLogged){ _bmsLogged = true; console.log(`[rimo] kartbmsdata sample (id ${id}, ${body.length} bytes) ::: ${String(body).replace(/\s+/g, ' ').slice(0, 4000)}`); }
   return parseKartData(body);
 }
-// Fast per-kart refresh for the kart the app is CURRENTLY viewing (rows in rimo_focus, kept fresh by a
-// heartbeat from the app). Only viewed kart(s) get fetched, but every ~1.5s — so the detail feed feels
-// live like RiMO's own page, without hammering the whole fleet.
+const _detailSig = {};
+// Signature of the LIVE values only (timestamps stripped) so a parked/unchanging kart doesn't re-write.
+function _detailSigOf(d, bms){
+  const strip = o => { if (!o) return o; const c = { ...o }; ['timestamp','timestampReboot','timestampEnginestart'].forEach(k => delete c[k]); return c; };
+  return JSON.stringify(strip(d)) + '|' + JSON.stringify(strip(bms));
+}
+// Fast per-kart refresh for the kart the app is CURRENTLY viewing (rows in rimo_focus). We FETCH every
+// ~1.5s (cheap — inbound), but only WRITE to Supabase (the metered outbound) when the live values actually
+// change. So a kart sitting idle costs ~nothing; a driving kart updates live like RiMO's own page.
 async function focusSweep(){
-  if (!supa || _focusRunning || !loggedIn) return;
+  if (!supa || _focusRunning || !loggedIn || process.env.RIMO_DETAIL === 'off') return;
   _focusRunning = true;
   try {
     const since = new Date(Date.now() - 20000).toISOString();
@@ -174,7 +180,12 @@ async function focusSweep(){
       const id = _idBySerial[serial]; if (!id) continue;
       try {
         const [d, bms] = await Promise.all([ fetchKartData(id).catch(() => null), fetchKartBms(id).catch(() => null) ]);
-        if (d || bms){ const data = { ...(d || {}), _bms: (bms || null) }; await supa.from('rimo_detail').upsert({ serial_no: serial, kart_no: (d && d.kartNo) || null, data, updated_at: new Date().toISOString() }, { onConflict: 'serial_no' }); }
+        if (!d && !bms) continue;
+        const sig = _detailSigOf(d, bms);
+        if (_detailSig[serial] === sig) continue;   // unchanged since last write — skip it (this is the bandwidth saver)
+        _detailSig[serial] = sig;
+        const data = { ...(d || {}), _bms: (bms || null) };
+        await supa.from('rimo_detail').upsert({ serial_no: serial, kart_no: (d && d.kartNo) || null, data, updated_at: new Date().toISOString() }, { onConflict: 'serial_no' });
       } catch (e) {}
     }
   } finally { _focusRunning = false; }
@@ -221,9 +232,10 @@ function startRimo(){
   if (!USER || !PASS) { console.log('[rimo] RIMO_USER/RIMO_PASS not set — RiMO poller disabled'); return; }
   syncRimo();
   setInterval(syncRimo, POLL_MS);
+  const detailOn = process.env.RIMO_DETAIL !== 'off';
   const FOCUS_MS = Math.max(1000, parseInt(process.env.RIMO_FOCUS_MS || '1500', 10));
-  setTimeout(function run(){ focusSweep().catch(() => {}).finally(() => setTimeout(run, FOCUS_MS)); }, 3000);   // fast per-kart telemetry for the viewed kart
-  console.log(`[rimo] poller started — grid every ${POLL_MS / 1000}s, focus detail every ${FOCUS_MS}ms`);
+  if (detailOn) setTimeout(function run(){ focusSweep().catch(() => {}).finally(() => setTimeout(run, FOCUS_MS)); }, 3000);   // fast per-kart telemetry for the viewed kart
+  console.log(`[rimo] poller started — grid every ${POLL_MS / 1000}s` + (detailOn ? `, focus detail every ${FOCUS_MS}ms (only writes on change)` : ', detail OFF (grid only: online/SOC/BMS)'));
 }
 
 module.exports = { startRimo, syncRimo, parseRimoRows };
