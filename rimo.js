@@ -48,6 +48,7 @@ function H(extra = {}){ return { Cookie: cookieHeader(), 'User-Agent': 'Mozilla/
 
 let loggedIn = false;
 let _rimoSig = {};   // serial_no -> last state signature, so we only write karts that changed
+let _kdLogged = false;   // log the per-kart feed shape once, to build the detail view
 
 async function rimoLogin(){
   jar = {};
@@ -98,9 +99,11 @@ function parseRimoRows(xml){
     if (cells.length < 9 || !cells[1]) continue;   // need at least through BMS + a serial
     const socRaw = (cells[11] || '').replace('%', '').trim();
     const last   = (cells[20] || '').trim();
+    const idm    = rm[0].match(/<row\b[^>]*\bid=["']?([^"'\s>]+)/i);
     out.push({
       serial_no:  cells[1],
       kart_no:    /^\d+$/.test(cells[0]) ? parseInt(cells[0], 10) : null,
+      _rimoId:    idm ? idm[1] : null,
       karttrack:  cells[2] || '',
       group_name: cells[3] || '',
       preset:     cells[4] || '',
@@ -127,6 +130,15 @@ async function fetchGrid(url){
 }
 
 let _running = false;
+async function fetchKartDataSample(id, kartNo){
+  try {
+    const u = `${BASE}/data/kartdata.php?id=${encodeURIComponent(id)}`;
+    const r = await fetch(u, { headers: H({ Accept: '*/*', 'X-Requested-With': 'XMLHttpRequest', Referer: `${BASE}/karts.php` }), redirect: 'manual', signal: AbortSignal.timeout(15000) });
+    absorb(r);
+    const body = await r.text().catch(() => '');
+    console.log(`[rimo] kartdata sample · kart ${kartNo} id ${id} · status ${r.status} · ${body.length} bytes ::: ${String(body).replace(/\s+/g, ' ').slice(0, 1000)}`);
+  } catch (e) { console.log('[rimo] kartdata sample error:', e.message || e); }
+}
 async function syncRimo(){
   if (!supa) { console.error('[rimo] missing Supabase env'); return; }
   if (_running) return;   // CRITICAL: never overlap — concurrent polls share one cookie jar and clobber each other's login
@@ -142,6 +154,8 @@ async function syncRimo(){
     }
     const rows = parseRimoRows(res.body);
     if (!rows.length) { console.log(`[rimo] 0 rows parsed (status ${res.status}, ${String(res.body).length} bytes) ${String(res.body).slice(0, 120).replace(/\s+/g, ' ')}`); return; }
+    // ONE-TIME: fetch a kart's per-kart feed (kartdata.php) and log its shape so the detail view can be built.
+    if (!_kdLogged){ const oc = rows.find(r => r.online && r._rimoId) || rows.find(r => r._rimoId); if (oc){ _kdLogged = true; fetchKartDataSample(oc._rimoId, oc.kart_no).catch(() => {}); } }
     // Only write karts whose meaningful state changed since the last poll. At a 1s poll that means
     // ~0 writes most seconds and a handful when a kart flips online/off — the whole fleet is still
     // fully readable (unchanged rows keep their last value), we just avoid re-writing 200 rows/sec.
@@ -149,7 +163,7 @@ async function syncRimo(){
     const changed = [];
     for (const x of rows){
       const sig = [x.online ? 1 : 0, x.bms_ok ? 1 : 0, x.soc, x.last_online, x.hours, x.preset, x.speedset, x.group_name, x.kart_no].join('|');
-      if (_rimoSig[x.serial_no] !== sig){ _rimoSig[x.serial_no] = sig; changed.push({ ...x, updated_at: now }); }
+      if (_rimoSig[x.serial_no] !== sig){ _rimoSig[x.serial_no] = sig; const { _rimoId, ...rest } = x; changed.push({ ...rest, updated_at: now }); }
     }
     if (!changed.length) return;   // nothing changed — skip the write entirely
     const { error } = await supa.from('rimo_karts').upsert(changed, { onConflict: 'serial_no' });
