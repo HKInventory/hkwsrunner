@@ -45,7 +45,7 @@ function absorb(res){
   for (const sc of (list || [])){ const p = sc.split(';')[0], i = p.indexOf('='); if (i > 0) jar[p.slice(0, i).trim()] = p.slice(i + 1).trim(); }
 }
 function cookieHeader(){ return Object.keys(jar).map(k => `${k}=${jar[k]}`).join('; '); }
-function H(extra = {}){ return { Cookie: cookieHeader(), 'User-Agent': 'HKWorkshopBot/1.0', ...extra }; }
+function H(extra = {}){ return { Cookie: cookieHeader(), 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36', ...extra }; }
 
 let loggedIn = false;
 let _rimoSig = {};   // serial_no -> last state signature, so we only write karts that changed
@@ -72,7 +72,7 @@ async function rimoLogin(){
   const ok = !(vstatus === 302 && /login\.php/i.test(vloc)) && !/<input[^>]*name=["']?password/i.test(vbody) && vstatus < 400;
   if (!ok) {
     loggedIn = false;
-    console.log(`[rimo] login NOT accepted — logincheck(${r.status}) "${String(txt).slice(0, 60).replace(/\s+/g, ' ')}" · karts.php(${vstatus}${vloc ? ' -> ' + vloc : ''}) · cookies: ${Object.keys(jar).join(',') || 'NONE'} — check RIMO_USER/RIMO_PASS`);
+    console.log(`[rimo] login NOT accepted — sent user='${USER}' pass=${passwordField().slice(0, 6)}…(${passwordField().length}) · logincheck(${r.status}) "${String(txt).slice(0, 60).replace(/\s+/g, ' ')}" · karts.php(${vstatus}${vloc ? ' -> ' + vloc : ''}) · cookies: ${Object.keys(jar).join(',') || 'NONE'}`);
     throw new Error('login not accepted');
   }
   loggedIn = true;
