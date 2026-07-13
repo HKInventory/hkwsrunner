@@ -128,7 +128,7 @@ async function fetchGrid(url){
   return { status: r.status, loc, body, authFail };
 }
 
-let _running = false, _onlineKarts = [], _detailRunning = false;
+let _running = false, _idBySerial = {}, _focusRunning = false, _bmsLogged = false;
 // kartdata.php returns XML like <data><tag><![CDATA[value]]></tag>…</data>. Pull every leaf field.
 function parseKartData(xml){
   const inner = (String(xml).match(/<data>([\s\S]*)<\/data>/i) || [null, String(xml)])[1];
@@ -150,20 +150,34 @@ async function fetchKartData(id){
   if (!/<data>/i.test(body)) return null;
   return parseKartData(body);
 }
-// Pull each ONLINE kart's live per-kart telemetry into rimo_detail so the app's kart detail is live.
-async function detailSweep(){
-  if (!supa || _detailRunning || !loggedIn) return;
-  _detailRunning = true;
+async function fetchKartBms(id){
+  const u = `${BASE}/data/kartbmsdata.php?id=${encodeURIComponent(id)}`;
+  const r = await fetch(u, { headers: H({ Accept: '*/*', 'X-Requested-With': 'XMLHttpRequest', Referer: `${BASE}/karts.php` }), redirect: 'manual', signal: AbortSignal.timeout(15000) });
+  absorb(r);
+  if (r.status === 302 || /login\.php/i.test(r.headers.get('location') || '')) { loggedIn = false; return null; }
+  const body = await r.text().catch(() => '');
+  if (!/<data>/i.test(body)) return null;
+  if (!_bmsLogged){ _bmsLogged = true; console.log(`[rimo] kartbmsdata sample (id ${id}, ${body.length} bytes) ::: ${String(body).replace(/\s+/g, ' ').slice(0, 1100)}`); }
+  return parseKartData(body);
+}
+// Fast per-kart refresh for the kart the app is CURRENTLY viewing (rows in rimo_focus, kept fresh by a
+// heartbeat from the app). Only viewed kart(s) get fetched, but every ~1.5s — so the detail feed feels
+// live like RiMO's own page, without hammering the whole fleet.
+async function focusSweep(){
+  if (!supa || _focusRunning || !loggedIn) return;
+  _focusRunning = true;
   try {
-    const list = _onlineKarts.slice(0, 80);
-    let ok = 0;
-    for (const k of list){
-      try { const d = await fetchKartData(k.id); if (d){ await supa.from('rimo_detail').upsert({ serial_no: k.serial, kart_no: k.kartNo, data: d, updated_at: new Date().toISOString() }, { onConflict: 'serial_no' }); ok++; } }
-      catch (e) {}
-      await new Promise(r => setTimeout(r, 120));
+    const since = new Date(Date.now() - 20000).toISOString();
+    const { data } = await supa.from('rimo_focus').select('serial_no').gte('updated_at', since);
+    const focus = (data || []).map(r => r.serial_no).filter(Boolean).slice(0, 4);
+    for (const serial of focus){
+      const id = _idBySerial[serial]; if (!id) continue;
+      try {
+        const [d, bms] = await Promise.all([ fetchKartData(id).catch(() => null), fetchKartBms(id).catch(() => null) ]);
+        if (d || bms){ const data = { ...(d || {}), _bms: (bms || null) }; await supa.from('rimo_detail').upsert({ serial_no: serial, kart_no: (d && d.kartNo) || null, data, updated_at: new Date().toISOString() }, { onConflict: 'serial_no' }); }
+      } catch (e) {}
     }
-    if (ok) console.log(`[rimo] detail: ${ok}/${list.length} online karts refreshed`);
-  } finally { _detailRunning = false; }
+  } finally { _focusRunning = false; }
 }
 async function syncRimo(){
   if (!supa) { console.error('[rimo] missing Supabase env'); return; }
@@ -180,8 +194,8 @@ async function syncRimo(){
     }
     const rows = parseRimoRows(res.body);
     if (!rows.length) { console.log(`[rimo] 0 rows parsed (status ${res.status}, ${String(res.body).length} bytes) ${String(res.body).slice(0, 120).replace(/\s+/g, ' ')}`); return; }
-    // Remember which karts are online (+ their internal id) so the detail sweep can pull kartdata.php.
-    _onlineKarts = rows.filter(r => r.online && r._rimoId).map(r => ({ serial: r.serial_no, id: r._rimoId, kartNo: r.kart_no }));
+    // Map every kart's serial -> internal id so the focus sweep can pull its per-kart feeds on demand.
+    rows.forEach(r => { if (r._rimoId) _idBySerial[r.serial_no] = r._rimoId; });
     // Only write karts whose meaningful state changed since the last poll. At a 1s poll that means
     // ~0 writes most seconds and a handful when a kart flips online/off — the whole fleet is still
     // fully readable (unchanged rows keep their last value), we just avoid re-writing 200 rows/sec.
@@ -203,9 +217,9 @@ function startRimo(){
   if (!USER || !PASS) { console.log('[rimo] RIMO_USER/RIMO_PASS not set — RiMO poller disabled'); return; }
   syncRimo();
   setInterval(syncRimo, POLL_MS);
-  const DETAIL_MS = Math.max(6, parseInt(process.env.RIMO_DETAIL_SEC || '12', 10)) * 1000;
-  setTimeout(function run(){ detailSweep().catch(() => {}).finally(() => setTimeout(run, DETAIL_MS)); }, 5000);   // per-kart telemetry sweep
-  console.log(`[rimo] poller started — grid every ${POLL_MS / 1000}s, detail every ${DETAIL_MS / 1000}s`);
+  const FOCUS_MS = Math.max(1000, parseInt(process.env.RIMO_FOCUS_MS || '1500', 10));
+  setTimeout(function run(){ focusSweep().catch(() => {}).finally(() => setTimeout(run, FOCUS_MS)); }, 3000);   // fast per-kart telemetry for the viewed kart
+  console.log(`[rimo] poller started — grid every ${POLL_MS / 1000}s, focus detail every ${FOCUS_MS}ms`);
 }
 
 module.exports = { startRimo, syncRimo, parseRimoRows };
