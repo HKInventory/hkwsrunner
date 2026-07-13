@@ -25,7 +25,7 @@ const RF_USER = process.env.RF_USER || 'HKWS';
 const RF_PASS = process.env.RF_PASS || 'HKWS';
 const SB_URL  = process.env.SUPABASE_URL || process.env.SB_URL;
 const SB_KEY  = process.env.SUPABASE_SERVICE_KEY || process.env.SB_SERVICE_KEY;
-const SAFETY_POLL_MS = Number(process.env.SAFETY_POLL_MS) || 25000;
+const SAFETY_POLL_MS = Number(process.env.SAFETY_POLL_MS) || 3000;
 
 if (!SB_URL || !SB_KEY) { console.error('[rf-push] missing SB_URL / SB_SERVICE_KEY (or SUPABASE_URL / SUPABASE_SERVICE_KEY)'); process.exit(1); }
 const supa = createClient(SB_URL, SB_KEY, { auth: { persistSession: false }, realtime: { params: { eventsPerSecond: 5 } } });
@@ -55,6 +55,7 @@ async function rfLogin(){
   absorb(r);
   if (r.status === 200 && /login/i.test((await r.text()) || '')) throw new Error('login rejected — check RF_USER/RF_PASS');
   loggedIn = true;
+  try { _ctxCache.clear(); } catch {}   // fresh session → old CSRF tokens are stale
   console.log('[rf-push] logged into RaceFacer OK');
 }
 async function keepWarm(){ // hit an authed page so the session never goes cold between repairs
@@ -236,7 +237,11 @@ async function dumpDamagePage(kartId){
   return { html: ctx.html, parsedParts: Object.values(ctx.parts), users: Object.keys(ctx.users).length, kart_type_id: ctx.kart_type_id };
 }
 
+const _ctxCache = new Map();   // kartId -> {ctx, at} — the CSRF token + user list are session-stable, so
+const CTX_TTL = 20000;         // back-to-back notes/repairs to a kart reuse it instead of re-fetching the page
 async function formContext(kartId){
+  const hit = _ctxCache.get(kartId);
+  if (hit && Date.now() - hit.at < CTX_TTL) return hit.ctx;
   const url = `${RF_BASE}/en/administration/garage/damage?kart_id=${kartId}`;
   const r = await fetch(url, { agent, headers: rfHeaders({ Referer: url }), redirect:'manual' });
   absorb(r);
@@ -246,7 +251,9 @@ async function formContext(kartId){
   const users = parseOptions(html, 'name="user_id"');
   const parts = await resolvePartsList(html, kartId);
   const kart_type_id = Number(html.match(/kart_type_id["']?\s*[:=]\s*["']?(\d+)/i)?.[1] || html.match(/name="kart_type"[^>]*value="(\d+)"/i)?.[1] || 0);
-  return { token, users, parts, kart_type_id, html };
+  const ctx = { token, users, parts, kart_type_id, html };
+  _ctxCache.set(kartId, { ctx, at: Date.now() });
+  return ctx;
 }
 let _loggedRfUsers = false;
 function resolveUser(name, users){
@@ -378,7 +385,7 @@ async function rfCreateStatus(row){
 }
 
 /* ---------------- queue drain (locked so realtime + poll never overlap) ---------------- */
-let draining = false;
+let draining = false, _redrain = false;
 /* ---- kart admin edits (track type / safety server / status) --------------------------------
    The app queues a change with only the fields to change (null = leave alone). RaceFacer's edit
    form REPLACES the whole row, so we read the kart's current record first (karts-info), overlay the
@@ -559,9 +566,17 @@ async function drainTable(table, submit, scrape){
   }
 }
 async function drainAll(scrape){
-  if (draining) return; draining = true;
-  try { await drainTable('rf_repair_queue', rfCreateDamage, scrape); await drainTable('rf_note_queue', rfCreateNote, scrape); await drainTable('rf_status_queue', rfCreateStatus, scrape); await drainTable('rf_kart_edit_queue', rfEditKart); }
-  finally { draining = false; }
+  if (draining){ _redrain = true; return; }   // a row arrived mid-drain — re-run right after, don't wait for the poll
+  draining = true;
+  try {
+    do {
+      _redrain = false;
+      await drainTable('rf_repair_queue', rfCreateDamage, scrape);
+      await drainTable('rf_note_queue', rfCreateNote, scrape);
+      await drainTable('rf_status_queue', rfCreateStatus, scrape);
+      await drainTable('rf_kart_edit_queue', rfEditKart);
+    } while (_redrain);
+  } finally { draining = false; }
 }
 
 /* ---- warehouse: RaceFacer's REAL parts stock -------------------------------------------
