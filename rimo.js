@@ -25,8 +25,8 @@ const SB_KEY = process.env.SUPABASE_SERVICE_KEY || process.env.SB_SERVICE_KEY;
 const supa = (SB_URL && SB_KEY) ? createClient(SB_URL, SB_KEY, { auth: { persistSession: false } }) : null;
 
 const BASE    = (process.env.RIMO_BASE || 'http://wfm.rimo-germany.com').replace(/\/+$/, '');
-const USER    = process.env.RIMO_USER || '';
-const PASS    = process.env.RIMO_PASS || '';
+const USER    = (process.env.RIMO_USER || '').trim();
+const PASS    = (process.env.RIMO_PASS || '').trim();
 const POLL_MS = Math.max(1, parseInt(process.env.RIMO_POLL_SEC || '4', 10)) * 1000;
 let   KARTS_URL = process.env.RIMO_KARTS_URL || `${BASE}/data/kartgrid.php`;   // confirmed live-grid feed
 
