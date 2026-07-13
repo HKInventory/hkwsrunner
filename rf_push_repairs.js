@@ -412,7 +412,7 @@ async function fetchKartsInfo(force){
       let j; try { j = JSON.parse(lastText); } catch { continue; }
       const groups = (j && (j.kart_names || j.karts || j.karts_info)) || {};
       const recs = [];
-      for (const k in groups){ const arr = groups[k]; if (Array.isArray(arr)) for (const x of arr){ if (x && x.id != null) recs.push(x); } }
+      for (const k in groups){ const arr = groups[k]; if (Array.isArray(arr)) for (const x of arr){ if (x && x.id != null){ if (x.kart_type_id == null && /^\d+$/.test(String(k))) x.kart_type_id = Number(k); recs.push(x); } } }
       if (recs.length){ _kartsInfoCache = { at: Date.now(), records: recs }; return recs; }
     } catch(e){ if (/session expired/.test(e.message||'')) throw e; }
   }
@@ -436,6 +436,12 @@ async function syncKartRecords(){
     if (!recs.length){ console.log("[rf-push] kart records: none parsed -> select payload from rf_debug where kind='edit_kart' order by id desc limit 1;"); return; }
     const now = new Date().toISOString();
     const rows = recs.map(x => ({ rf_kart_id: Number(x.id), fields: x, updated_at: now }));
+    // One-time visibility: are kart_type_id / safety_server_id actually present per kart? If they're
+    // missing/identical, the Admin dropdowns can't pre-select the kart's real type/server.
+    if (!syncKartRecords._logged){ syncKartRecords._logged = true;
+      const s = recs.slice(0, 4).map(x => `${x.id}:type=${x.kart_type_id}/srv=${x.safety_server_id}`).join('  ');
+      console.log(`[rf-push] kart-record sample -> ${s} · keys: ${Object.keys(recs[0]||{}).join(',')}`);
+    }
     const { error } = await supa.from('rf_kart_admin').upsert(rows, { onConflict:'rf_kart_id' });
     if (error) console.error('[rf-push] kart records upsert:', error.message);
     else console.log(`[rf-push] kart records synced: ${rows.length}`);
