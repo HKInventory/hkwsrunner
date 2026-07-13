@@ -19,6 +19,7 @@
    7 Online(1/0), 8 BMS(1/0), 11 SOC(%), 20 Last-online. The rest is kept in `raw`.
    ========================================================================== */
 const { createClient } = require('@supabase/supabase-js');
+const crypto = require('crypto');
 
 const SB_URL = process.env.SUPABASE_URL || process.env.SB_URL;
 const SB_KEY = process.env.SUPABASE_SERVICE_KEY || process.env.SB_SERVICE_KEY;
@@ -29,6 +30,12 @@ const USER    = (process.env.RIMO_USER || '').trim();
 const PASS    = (process.env.RIMO_PASS || '').trim();
 const POLL_MS = Math.max(1, parseInt(process.env.RIMO_POLL_SEC || '4', 10)) * 1000;
 let   KARTS_URL = process.env.RIMO_KARTS_URL || `${BASE}/data/kartgrid.php`;   // confirmed live-grid feed
+
+// RiMO's login page MD5-hashes the password in the browser before POSTing it, so we send md5(password).
+// If someone stored the already-hashed 32-char value in RIMO_PASS, use it as-is.
+function passwordField(){
+  return /^[a-f0-9]{32}$/i.test(PASS) ? PASS.toLowerCase() : crypto.createHash('md5').update(PASS, 'utf8').digest('hex');
+}
 
 // ---- tiny cookie jar (PHPSESSID) --------------------------------------------
 let jar = {};
@@ -48,7 +55,7 @@ async function rimoLogin(){
   // 1) touch login.php so PHP hands us a session cookie
   try { const r0 = await fetch(`${BASE}/login.php`, { headers: H({ Accept: 'text/html' }), redirect: 'manual', signal: AbortSignal.timeout(15000) }); absorb(r0); } catch (e) {}
   // 2) submit the codes
-  const body = new URLSearchParams({ user: USER, password: PASS }).toString();
+  const body = new URLSearchParams({ user: USER, password: passwordField() }).toString();
   const r = await fetch(`${BASE}/template/logincheck.php`, { method: 'POST',
     headers: H({ 'Content-type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest',
       Origin: BASE, Referer: `${BASE}/login.php`, Accept: '*/*' }), body, redirect: 'manual', signal: AbortSignal.timeout(15000) });
