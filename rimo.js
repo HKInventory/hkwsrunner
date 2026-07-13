@@ -33,8 +33,9 @@ let   KARTS_URL = process.env.RIMO_KARTS_URL || `${BASE}/data/kartgrid.php`;   /
 // ---- tiny cookie jar (PHPSESSID) --------------------------------------------
 let jar = {};
 function absorb(res){
-  const list = res.headers.getSetCookie ? res.headers.getSetCookie() : [];
-  for (const sc of list){ const p = sc.split(';')[0], i = p.indexOf('='); if (i > 0) jar[p.slice(0, i).trim()] = p.slice(i + 1).trim(); }
+  let list = res.headers.getSetCookie ? res.headers.getSetCookie() : [];
+  if (!list || !list.length) { const raw = res.headers.get('set-cookie'); if (raw) list = [raw]; }   // fallback
+  for (const sc of (list || [])){ const p = sc.split(';')[0], i = p.indexOf('='); if (i > 0) jar[p.slice(0, i).trim()] = p.slice(i + 1).trim(); }
 }
 function cookieHeader(){ return Object.keys(jar).map(k => `${k}=${jar[k]}`).join('; '); }
 function H(extra = {}){ return { Cookie: cookieHeader(), 'User-Agent': 'HKWorkshopBot/1.0', ...extra }; }
@@ -53,11 +54,22 @@ async function rimoLogin(){
       Origin: BASE, Referer: `${BASE}/login.php`, Accept: '*/*' }), body, redirect: 'manual', signal: AbortSignal.timeout(15000) });
   absorb(r);
   const txt = await r.text().catch(() => '');
-  if (r.status >= 400 || /invalid|incorrect|fehler|denied|wrong/i.test(txt)) {
-    loggedIn = false; throw new Error(`login failed (${r.status}) ${txt.slice(0, 120)}`);
+  // 3) establish + VERIFY the session by loading karts.php (the page that hosts the grid). Some PHP
+  //    setups only finalise the authed session once you land on a real page after logincheck, and this
+  //    also tells us definitively whether the credentials were accepted.
+  let vloc = '', vstatus = 0, vbody = '';
+  try {
+    const v = await fetch(`${BASE}/karts.php`, { headers: H({ Accept: 'text/html', Referer: `${BASE}/login.php` }), redirect: 'manual', signal: AbortSignal.timeout(15000) });
+    absorb(v); vstatus = v.status; vloc = v.headers.get('location') || ''; vbody = await v.text().catch(() => '');
+  } catch (e) {}
+  const ok = !(vstatus === 302 && /login\.php/i.test(vloc)) && !/<input[^>]*name=["']?password/i.test(vbody) && vstatus < 400;
+  if (!ok) {
+    loggedIn = false;
+    console.log(`[rimo] login NOT accepted — logincheck(${r.status}) "${String(txt).slice(0, 60).replace(/\s+/g, ' ')}" · karts.php(${vstatus}${vloc ? ' -> ' + vloc : ''}) · cookies: ${Object.keys(jar).join(',') || 'NONE'} — check RIMO_USER/RIMO_PASS`);
+    throw new Error('login not accepted');
   }
   loggedIn = true;
-  console.log('[rimo] logged in');
+  console.log(`[rimo] logged in (cookies: ${Object.keys(jar).join(',') || 'none'})`);
 }
 
 function feedUrl(){
