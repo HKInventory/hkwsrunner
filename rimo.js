@@ -157,7 +157,7 @@ async function fetchKartBms(id){
   if (r.status === 302 || /login\.php/i.test(r.headers.get('location') || '')) { loggedIn = false; return null; }
   const body = await r.text().catch(() => '');
   if (!/<data>/i.test(body)) return null;
-  if (!_bmsLogged){ _bmsLogged = true; console.log(`[rimo] kartbmsdata sample (id ${id}, ${body.length} bytes) ::: ${String(body).replace(/\s+/g, ' ').slice(0, 1100)}`); }
+  if (!_bmsLogged){ _bmsLogged = true; console.log(`[rimo] kartbmsdata sample (id ${id}, ${body.length} bytes) ::: ${String(body).replace(/\s+/g, ' ').slice(0, 4000)}`); }
   return parseKartData(body);
 }
 // Fast per-kart refresh for the kart the app is CURRENTLY viewing (rows in rimo_focus, kept fresh by a
@@ -202,8 +202,12 @@ async function syncRimo(){
     const now = new Date().toISOString();
     const changed = [];
     for (const x of rows){
-      const sig = [x.online ? 1 : 0, x.bms_ok ? 1 : 0, x.soc, x.last_online, x.hours, x.preset, x.speedset, x.group_name, x.kart_no].join('|');
-      if (_rimoSig[x.serial_no] !== sig){ _rimoSig[x.serial_no] = sig; const { _rimoId, ...rest } = x; changed.push({ ...rest, updated_at: now }); }
+      // Only meaningful state triggers a write. last_online ticks every second and hours drifts constantly
+      // for every online kart — including them here re-wrote the whole online fleet every single poll (the
+      // bandwidth drain). They still get written — they ride along on the next real change — just aren't a
+      // trigger themselves. online/bms flips and soc/preset/speedset changes still write promptly.
+      const sig = [x.online ? 1 : 0, x.bms_ok ? 1 : 0, x.soc, x.preset, x.speedset, x.group_name, x.kart_no].join('|');
+      if (_rimoSig[x.serial_no] !== sig){ _rimoSig[x.serial_no] = sig; const { _rimoId, raw, ...rest } = x; changed.push({ ...rest, updated_at: now }); }   // drop raw (large cell array, nothing reads it) from the write
     }
     if (!changed.length) return;   // nothing changed — skip the write entirely
     const { error } = await supa.from('rimo_karts').upsert(changed, { onConflict: 'serial_no' });
