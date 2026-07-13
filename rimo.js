@@ -48,7 +48,6 @@ function H(extra = {}){ return { Cookie: cookieHeader(), 'User-Agent': 'Mozilla/
 
 let loggedIn = false;
 let _rimoSig = {};   // serial_no -> last state signature, so we only write karts that changed
-let _kdLogged = false;   // log the per-kart feed shape once, to build the detail view
 
 async function rimoLogin(){
   jar = {};
@@ -129,15 +128,42 @@ async function fetchGrid(url){
   return { status: r.status, loc, body, authFail };
 }
 
-let _running = false;
-async function fetchKartDataSample(id, kartNo){
+let _running = false, _onlineKarts = [], _detailRunning = false;
+// kartdata.php returns XML like <data><tag><![CDATA[value]]></tag>…</data>. Pull every leaf field.
+function parseKartData(xml){
+  const inner = (String(xml).match(/<data>([\s\S]*)<\/data>/i) || [null, String(xml)])[1];
+  const out = {};
+  const re = /<([a-zA-Z0-9_]+)>([\s\S]*?)<\/\1>/g;
+  let m; while ((m = re.exec(inner))){
+    const k = m[1]; let v = m[2];
+    const cd = v.match(/<!\[CDATA\[([\s\S]*?)\]\]>/); if (cd) v = cd[1];
+    out[k] = v.trim();
+  }
+  return out;
+}
+async function fetchKartData(id){
+  const u = `${BASE}/data/kartdata.php?id=${encodeURIComponent(id)}`;
+  const r = await fetch(u, { headers: H({ Accept: '*/*', 'X-Requested-With': 'XMLHttpRequest', Referer: `${BASE}/karts.php` }), redirect: 'manual', signal: AbortSignal.timeout(15000) });
+  absorb(r);
+  if (r.status === 302 || /login\.php/i.test(r.headers.get('location') || '')) { loggedIn = false; return null; }
+  const body = await r.text().catch(() => '');
+  if (!/<data>/i.test(body)) return null;
+  return parseKartData(body);
+}
+// Pull each ONLINE kart's live per-kart telemetry into rimo_detail so the app's kart detail is live.
+async function detailSweep(){
+  if (!supa || _detailRunning || !loggedIn) return;
+  _detailRunning = true;
   try {
-    const u = `${BASE}/data/kartdata.php?id=${encodeURIComponent(id)}`;
-    const r = await fetch(u, { headers: H({ Accept: '*/*', 'X-Requested-With': 'XMLHttpRequest', Referer: `${BASE}/karts.php` }), redirect: 'manual', signal: AbortSignal.timeout(15000) });
-    absorb(r);
-    const body = await r.text().catch(() => '');
-    console.log(`[rimo] kartdata sample · kart ${kartNo} id ${id} · status ${r.status} · ${body.length} bytes ::: ${String(body).replace(/\s+/g, ' ').slice(0, 1000)}`);
-  } catch (e) { console.log('[rimo] kartdata sample error:', e.message || e); }
+    const list = _onlineKarts.slice(0, 80);
+    let ok = 0;
+    for (const k of list){
+      try { const d = await fetchKartData(k.id); if (d){ await supa.from('rimo_detail').upsert({ serial_no: k.serial, kart_no: k.kartNo, data: d, updated_at: new Date().toISOString() }, { onConflict: 'serial_no' }); ok++; } }
+      catch (e) {}
+      await new Promise(r => setTimeout(r, 120));
+    }
+    if (ok) console.log(`[rimo] detail: ${ok}/${list.length} online karts refreshed`);
+  } finally { _detailRunning = false; }
 }
 async function syncRimo(){
   if (!supa) { console.error('[rimo] missing Supabase env'); return; }
@@ -154,8 +180,8 @@ async function syncRimo(){
     }
     const rows = parseRimoRows(res.body);
     if (!rows.length) { console.log(`[rimo] 0 rows parsed (status ${res.status}, ${String(res.body).length} bytes) ${String(res.body).slice(0, 120).replace(/\s+/g, ' ')}`); return; }
-    // ONE-TIME: fetch a kart's per-kart feed (kartdata.php) and log its shape so the detail view can be built.
-    if (!_kdLogged){ const oc = rows.find(r => r.online && r._rimoId) || rows.find(r => r._rimoId); if (oc){ _kdLogged = true; fetchKartDataSample(oc._rimoId, oc.kart_no).catch(() => {}); } }
+    // Remember which karts are online (+ their internal id) so the detail sweep can pull kartdata.php.
+    _onlineKarts = rows.filter(r => r.online && r._rimoId).map(r => ({ serial: r.serial_no, id: r._rimoId, kartNo: r.kart_no }));
     // Only write karts whose meaningful state changed since the last poll. At a 1s poll that means
     // ~0 writes most seconds and a handful when a kart flips online/off — the whole fleet is still
     // fully readable (unchanged rows keep their last value), we just avoid re-writing 200 rows/sec.
@@ -177,7 +203,9 @@ function startRimo(){
   if (!USER || !PASS) { console.log('[rimo] RIMO_USER/RIMO_PASS not set — RiMO poller disabled'); return; }
   syncRimo();
   setInterval(syncRimo, POLL_MS);
-  console.log(`[rimo] poller started — every ${POLL_MS / 1000}s`);
+  const DETAIL_MS = Math.max(6, parseInt(process.env.RIMO_DETAIL_SEC || '12', 10)) * 1000;
+  setTimeout(function run(){ detailSweep().catch(() => {}).finally(() => setTimeout(run, DETAIL_MS)); }, 5000);   // per-kart telemetry sweep
+  console.log(`[rimo] poller started — grid every ${POLL_MS / 1000}s, detail every ${DETAIL_MS / 1000}s`);
 }
 
 module.exports = { startRimo, syncRimo, parseRimoRows };
