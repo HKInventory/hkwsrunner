@@ -31,7 +31,10 @@ if (!SB_URL || !SB_KEY) { console.error('[rf-push] missing SB_URL / SB_SERVICE_K
 const supa = createClient(SB_URL, SB_KEY, { auth: { persistSession: false }, realtime: { params: { eventsPerSecond: 5 } } });
 
 const RF_STATUS_ID = { ok: 1, damaged: 2, for_maintenance: 3 };   // RaceFacer: 1=OK, 2=DAMAGED, 3=MAINTENANCE
-const RF_USERS = { /* optional overrides, e.g. 'Harvey Betts': 92 */ };
+let RF_USERS = { /* optional overrides, e.g. 'Harvey Betts': 92 */ };
+try { if (process.env.RF_USERS_JSON) RF_USERS = { ...RF_USERS, ...JSON.parse(process.env.RF_USERS_JSON) }; }
+catch (e){ console.error('[rf-push] RF_USERS_JSON parse failed:', e.message || e); }
+const RF_DEFAULT_USER = Number(process.env.RF_DEFAULT_USER_ID) || null;   // fallback RaceFacer user_id
 
 /* ---------------- cookie jar + helpers ---------------- */
 let jar = {}, loggedIn = false;
@@ -113,7 +116,7 @@ function _rowsFromAjax(json){
     const name = o.name ?? o.text ?? o.title ?? o.label;
     if (pid == null || !name) continue;
     out.push({ part_id:Number(pid), id:Number(o.id ?? pid), max_qty:Number(o.max_qty ?? o.qty ?? o.quantity ?? 99),
-               price:Number(o.price ?? 0), name:String(name).trim() });
+               price:Number(o.price ?? o.default_price ?? o.unit_price ?? o.cost ?? o.sell_price ?? 0), name:String(name).trim() });
   }
   return out.filter(r => Number.isFinite(r.part_id) && r.name);
 }
@@ -245,11 +248,21 @@ async function formContext(kartId){
   const kart_type_id = Number(html.match(/kart_type_id["']?\s*[:=]\s*["']?(\d+)/i)?.[1] || html.match(/name="kart_type"[^>]*value="(\d+)"/i)?.[1] || 0);
   return { token, users, parts, kart_type_id, html };
 }
+let _loggedRfUsers = false;
 function resolveUser(name, users){
   const key = norm(name);
   for (const n in RF_USERS) if (norm(n) === key) return RF_USERS[n];
   if (users[key]) return users[key].id;
   for (const k in users) if (k.includes(key) || key.includes(k)) return users[k].id;
+  // Fallback so a note/repair is never lost just because the app account isn't itself a RaceFacer
+  // user (e.g. the owner). Prefer a configured default id, else the first user RaceFacer offers.
+  if (RF_DEFAULT_USER) return RF_DEFAULT_USER;
+  const first = Object.keys(users)[0];
+  if (first){
+    if (!_loggedRfUsers){ _loggedRfUsers = true; console.log(`[rf-push] RaceFacer users: ${Object.keys(users).map(k => `${k}=${users[k].id}`).join(', ')}`); }
+    console.log(`[rf-push] "${name}" isn't a RaceFacer user — attributing to id ${users[first].id}. To fix, set RF_USERS_JSON e.g. {"${name}":<id>} or RF_DEFAULT_USER_ID.`);
+    return users[first].id;
+  }
   return null;
 }
 function resolvePart(p, parts){
@@ -600,7 +613,17 @@ async function syncWarehouse(){ // publish RaceFacer's warehouse stock so the ap
     try { const w = await fetchWarehouseParts(); rows = w.rows; whHtml = w.html; }
     catch(e){ console.error('[rf-push] warehouse page fetch failed:', e.message || e); }
     if (rows.length){
-      console.log(`[rf-push] warehouse: ${rows.length} parts from warehouse page`);
+      // The warehouse list page has ids + live stock but no price. The Add-damage form's parts list
+      // DOES carry each part's price, so fetch it once and merge prices in (by id, then name). This is
+      // what makes the app's repair picker auto-fill the price.
+      try {
+        const ctx = await formContext(Number(process.env.RF_SAMPLE_KART) || 26);
+        const byId = {}, byName = {};
+        Object.values(ctx.parts || {}).forEach(p => { if (p.part_id != null) byId[p.part_id] = p; if (p.name) byName[norm(p.name)] = p; });
+        let priced = 0;
+        rows.forEach(r => { const m = byId[r.part_id] || byName[norm(r.name)]; if (m && Number(m.price) > 0){ r.price = Number(m.price); priced++; } });
+        console.log(`[rf-push] warehouse: ${rows.length} parts from warehouse page (${priced} priced from damage form)`);
+      } catch (e){ console.log(`[rf-push] warehouse: ${rows.length} parts (price merge skipped: ${e.message || e})`); }
     } else {
       // FALLBACK: the old Add-damage form scrape, in case the warehouse markup ever changes.
       const karts = [Number(process.env.RF_SAMPLE_KART) || 26, 13, 15, 39];
