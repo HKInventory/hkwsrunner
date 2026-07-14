@@ -134,7 +134,12 @@ async function fetchPartsAjax(html, kartId){
       const text = await r.text();
       let json; try { json = JSON.parse(text); } catch { continue; }
       const rows = _rowsFromAjax(json);
-      if (rows.length > 1){ console.log(`[rf-push] parts via Select2 AJAX ${raw} -> ${rows.length}`); return rows; }
+      if (rows.length > 1){
+        if (!fetchPartsAjax._logged){ fetchPartsAjax._logged = true;
+          try { const a = (Array.isArray(json) ? json : (json.results || json.data || json.items || [])); console.log('[rf-push] parts feed raw sample: ' + JSON.stringify(a[0] || {}).slice(0, 400)); } catch (e) {}
+        }
+        console.log(`[rf-push] parts via Select2 AJAX ${raw} -> ${rows.length}`); return rows;
+      }
       await rfDebug('parts_ajax', kartId, `tried ${raw}, parsed ${rows.length}`, text);
     }catch(e){ /* try the next candidate */ }
   }
@@ -396,9 +401,11 @@ let draining = false, _redrain = false;
    confirmed from the capture, so we try the likely candidates and log the raw body on failure:
      select payload from rf_debug where kind='edit_kart' order by id desc limit 1; */
 let _kartsInfoCache = { at: 0, records: [] };
-async function fetchKartsInfo(force){
+async function fetchKartsInfo(force, preferId){
   if (!force && Date.now() - _kartsInfoCache.at < 30000 && _kartsInfoCache.records.length) return _kartsInfoCache.records;
-  const sample = Number(process.env.RF_SAMPLE_KART) || 26;
+  // karts-info wants a kart_id param; some RaceFacer builds scope the response to that kart's
+  // context, so when we're hunting a specific kart, ask with ITS id (fall back to the sample).
+  const sample = Number(preferId) || Number(process.env.RF_SAMPLE_KART) || 26;
   const paths = ['/ajax/kart/karts-info', '/ajax/garage/karts-info'];
   let lastText = '';
   for (const p of paths){
@@ -413,17 +420,30 @@ async function fetchKartsInfo(force){
       const groups = (j && (j.kart_names || j.karts || j.karts_info)) || {};
       const recs = [];
       for (const k in groups){ const arr = groups[k]; if (Array.isArray(arr)) for (const x of arr){ if (x && x.id != null){ if (x.kart_type_id == null && /^\d+$/.test(String(k))) x.kart_type_id = Number(k); recs.push(x); } } }
-      if (recs.length){ _kartsInfoCache = { at: Date.now(), records: recs }; return recs; }
+      // Some payloads put the fleet at the top level (array) instead of grouped — accept that too.
+      if (!recs.length && Array.isArray(j)) for (const x of j){ if (x && x.id != null) recs.push(x); }
+      if (recs.length){
+        if (!fetchKartsInfo._logged){ fetchKartsInfo._logged = true;
+          const gk = Object.keys(groups); console.log(`[rf-push] karts-info parsed: ${recs.length} karts across ${gk.length} group(s) [${gk.slice(0,8).join(',')}]`); }
+        _kartsInfoCache = { at: Date.now(), records: recs }; return recs;
+      }
     } catch(e){ if (/session expired/.test(e.message||'')) throw e; }
   }
   await rfDebug('edit_kart', 0, 'karts-info: could not parse fleet / unexpected path', lastText || '(no response)');
   return [];
 }
 async function fetchKartRecord(kartId){
-  const recs = await fetchKartsInfo();
-  const hit = recs.find(x => Number(x.id) === Number(kartId));
+  // 1) cached / fresh fleet fetch
+  let recs = await fetchKartsInfo();
+  let hit = recs.find(x => Number(x.id) === Number(kartId));
   if (hit) return hit;
-  await rfDebug('edit_kart', kartId, 'karts-info: kart not found in fleet', recs.length ? JSON.stringify(recs[0]).slice(0,300) : '(empty)');
+  // 2) MISS — the 30s cache may hold a partial fleet (flaky earlier response), or this kart's
+  //    group wasn't in the sample-scoped payload. Refetch fresh, asking with THIS kart's id.
+  console.log(`[rf-push] kart ${kartId} not in cached fleet (${recs.length}) — refetching fresh with its own id`);
+  recs = await fetchKartsInfo(true, kartId);
+  hit = recs.find(x => Number(x.id) === Number(kartId));
+  if (hit) return hit;
+  await rfDebug('edit_kart', kartId, `karts-info: kart not found in fleet (${recs.length} records)`, recs.length ? JSON.stringify(recs[0]).slice(0,300) : '(empty)');
   throw new Error(`karts-info: could not load current record for kart ${kartId}`);
 }
 /* Mirror every kart's current full record into rf_kart_admin so the app can pre-fill the Admin
@@ -663,6 +683,17 @@ async function syncWarehouse(){ // publish RaceFacer's warehouse stock so the ap
       console.log("[rf-push] warehouse: no parts. Page captured -> select payload from rf_debug where kind='warehouse_html' order by id desc limit 1;");
       return;
     }
+    // Backfill prices from repair HISTORY: any part still at 0 that was used in a past repair takes
+    // that repair's most-recent price. RaceFacer's parts feed often carries no price, but real prices
+    // exist on past repairs — this is what actually prices consumables (batteries, sensors, etc.).
+    try {
+      const { data: rp } = await supa.from('rf_repair_parts').select('part_name,price,repair_id').gt('price', 0).order('repair_id', { ascending: false }).limit(5000);
+      const lastPrice = {};
+      (rp || []).forEach(p => { const n = norm(p.part_name); if (n && lastPrice[n] == null && Number(p.price) > 0) lastPrice[n] = Number(p.price); });
+      let hist = 0;
+      rows.forEach(r => { if (!(Number(r.price) > 0)){ const pr = lastPrice[norm(r.name)]; if (pr > 0){ r.price = pr; hist++; } } });
+      if (hist) console.log(`[rf-push] warehouse: +${hist} parts priced from repair history`);
+    } catch (e) { console.log('[rf-push] repair-history price merge skipped:', (e.message || e)); }
     // Upsert the full list; part_id is the unique key the app selects on.
     const { error } = await supa.from('rf_warehouse').upsert(rows, { onConflict:'part_id' });
     if (error) console.error('[rf-push] warehouse upsert:', error.message);
