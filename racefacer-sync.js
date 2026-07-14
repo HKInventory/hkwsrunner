@@ -9,6 +9,9 @@
 // Optional: RF_KART_IDS (comma list), RF_KART_TYPE_UUIDS (comma list), SITE (default sydney)
 
 const { fetch, Agent } = require('undici');
+const crypto = require('crypto');
+// Short stable hash of a repair row's content — a changed field (incl. mechanic) changes the hash.
+function contentHash(s){ return crypto.createHash('sha1').update(String(s)).digest('base64').slice(0, 20); }
 const { parseKartDetails, parseRepairs, parseParts, parseKartNotes, parseActiveNotes, parseGarageStatuses } = require('./racefacer-parse');
 const { reconcileDay } = require('./racefacer-reconcile');
 
@@ -410,6 +413,12 @@ async function syncAllRepairs() {
     if (j && j.total != null && Number(j.total)) total = Number(j.total);
     const items = (j && j.items) || [];
     if (page === 1) console.log(`[repairs] page 1: ${items.length} item(s); server reports total=${j && j.total}, last_page=${j && j.last_page}, per_page=${j && j.per_page}`);
+    if (page === 1 && items.length && !syncAllRepairs._logged){ syncAllRepairs._logged = true;
+      const s = items[0];
+      console.log(`[repairs] item keys: ${Object.keys(s).join(',')}`);
+      console.log(`[repairs] sample annotation="${String(s.annotation || '').slice(0, 60)}" damage_annotation="${String(s.damage_annotation || s.damage_description || s.notification_annotation || '').slice(0, 60)}"`);
+      console.log(`[repairs] mechanic candidates: user_name="${s.user_name||''}" mechanic_name="${s.mechanic_name||''}" repairer_name="${s.repairer_name||''}" repair_user_name="${s.repair_user_name||''}"`);
+    }
     if (!items.length) break;                            // past the end
     let added = 0;
     for (const it of items) {
@@ -420,20 +429,27 @@ async function syncAllRepairs() {
       const parts = (((it.used_parts || {}).data) || []).map((p) => ({
         name: p.warehouse_stock_name || 'Part', qty: Number(p.quantity) || 0, price: (p.price != null ? p.price : ''),
       }));
-      byId.set(it.id, { row: {
+      // Mechanic: prefer an explicit mechanic/repairer field if RaceFacer sends one (editing the
+      // repair's user in RF changes THAT, while user_name can stay as the original creator —
+      // which is why the TV kept crediting the old mechanic). Falls back to user_name.
+      const mech = it.mechanic_name || it.repairer_name || it.repair_user_name || it.user_name || null;
+      const row = {
         id: it.id, rf_kart_id: kid,
         description: it.annotation || '', notes: '',
         date_discovered: dashToIso(it.damage_discovery_date),
         date_repaired: dashToIso(it.repair_date),
         mileage: (Number.isFinite(Number(it.repair_km)) ? Number(it.repair_km) : null),
         cost: (Number.isFinite(Number(it.cost)) ? Number(it.cost) : null),
-        mechanic: it.user_name || null,
+        mechanic: mech,
         kart_name: (it.kart_name != null ? String(it.kart_name) : null),
         kart_type: it.kart_type_name || null,
         kart_garage_id: it.kart_garage_id || null,
         type_color: tc,
-        fingerprint: `rf|${it.id}`,
-      }, parts });
+      };
+      // Fingerprint = hash of the row content (+ parts) — lets each run skip unchanged rows
+      // instead of rewriting the whole table every heavy pass. Any edit (incl. mechanic) changes it.
+      row.fingerprint = contentHash(JSON.stringify(row) + '|' + JSON.stringify(parts));
+      byId.set(it.id, { row, parts });
       if (!byKart.has(kid)) byKart.set(kid, []);
       byKart.get(kid).push({ dateDiscovered: dashToDot(it.damage_discovery_date), dateRepaired: dashToDot(it.repair_date), user: it.user_name, parts });
     }
@@ -445,11 +461,24 @@ async function syncAllRepairs() {
   }
   console.log(`[repairs] fetch complete: ${byId.size} unique repairs over ${page - 1} page(s)${Number.isFinite(total) ? ` (RaceFacer reports ${total})` : ''}.`);
 
-  const repairRows = [], partRows = [];
+  // ── BANDWIDTH: only write what changed ─────────────────────────────────────
+  // Render meters the worker's OUTBOUND bytes; upserting every repair (and wiping/rebuilding
+  // every part line) each heavy pass was the biggest remaining GB source. Read the existing
+  // id->fingerprint map from Supabase (inbound = free on Render) and write only new/changed rows.
+  let existing = new Map();
+  try {
+    const cur = await sb('rf_repairs?select=id,fingerprint');
+    for (const r of (cur || [])) existing.set(Number(r.id), r.fingerprint || '');
+  } catch (e) { console.error('[repairs] fingerprint pre-read failed (writing all):', (e.message || '').slice(0, 100)); }
+
+  const repairRows = [], partRows = [], changedIds = [];
   for (const { row, parts } of byId.values()) {
+    if (existing.size && existing.get(Number(row.id)) === row.fingerprint) continue;   // unchanged — skip entirely
     repairRows.push(row);
+    changedIds.push(row.id);
     for (const p of parts) partRows.push({ repair_id: row.id, part_name: p.name, qty: p.qty, price: p.price });
   }
+  if (!repairRows.length) { console.log(`[repairs] full-fleet: 0 changed of ${byId.size} — no writes.`); return byKart; }
 
   // Write in chunks; if a chunk is rejected (in PostgREST one bad row fails the whole batch), split it
   // in half and retry each half — isolating a bad row in ~log2(n) calls so it can't stall the run.
@@ -475,10 +504,16 @@ async function syncAllRepairs() {
 
   // repairs first (parts FK references them); upsert on the RaceFacer id so edits update in place
   const badR = await writeChunked('rf_repairs?on_conflict=id', repairRows, 'resolution=merge-duplicates,return=minimal', 'repairs');
-  // parts: wipe + rebuild (small table — guarantees no duplicates without per-line bookkeeping)
-  try { await sb('rf_repair_parts?repair_id=gte.0', { method: 'DELETE' }); } catch (e) { console.error('[repairs] parts wipe failed:', (e.message || '').slice(0, 120)); }
+  // parts: wipe + rebuild ONLY for the repairs that changed (deleting/re-inserting the whole
+  // table every pass was pure outbound waste when nothing had changed)
+  try {
+    for (let i = 0; i < changedIds.length; i += 200) {
+      const chunk = changedIds.slice(i, i + 200);
+      await sb(`rf_repair_parts?repair_id=in.(${chunk.join(',')})`, { method: 'DELETE' });
+    }
+  } catch (e) { console.error('[repairs] parts wipe failed:', (e.message || '').slice(0, 120)); }
   const badP = await writeChunked('rf_repair_parts', partRows, 'return=minimal', 'repair-parts');
-  console.log(`[repairs] full-fleet: ${repairRows.length - badR}/${repairRows.length} repairs written${Number.isFinite(total) ? ' (' + total + ' reported by RaceFacer)' : ''}, ${partRows.length - badP}/${partRows.length} part lines, ${byKart.size} karts.`);
+  console.log(`[repairs] full-fleet: ${repairRows.length - badR}/${repairRows.length} changed repairs written (of ${byId.size} total${Number.isFinite(total) ? ', ' + total + ' reported by RaceFacer' : ''}), ${partRows.length - badP}/${partRows.length} part lines, ${byKart.size} karts.`);
   return byKart;
 }
 
