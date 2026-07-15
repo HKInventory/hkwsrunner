@@ -43,6 +43,9 @@ startRepairPusher(/* scrapeKartRepairs */);   // optional: pass a per-kart re-sc
 // ---- 1b. RiMO Germany WFM poller (live online / SOC / BMS per kart) --------
 try { require('./rimo').startRimo(); } catch (e) { console.error('[rimo] failed to start:', e.message || e); }
 
+// ---- 1c. HK AI (answers ai_queue questions via the Anthropic API; key in env) --------
+try { require('./hkai').startAI(); } catch (e) { console.error('[ai] failed to start:', e.message || e); }
+
 // ---- PERSISTENT STATUS POLLER (in-process, no re-spawn/re-login) -----------
 // Status changes must feel instant. Spawning a fresh racefacer-sync.js each cycle re-logs into
 // RaceFacer (~1-2s handshake) EVERY time, which caps how fast we can go. So status runs here,
@@ -143,9 +146,33 @@ function loop(tag, gapMs, extraEnv){
 
 log(`combined worker up · site=${SITE} · pusher live · status ~${STATUS_POLL / 1000}s · notes sweep concurrency ${NOTES_CONC} · full-sync ~${HEAVY_GAP / 1000}s`);
 
+// SESSIONS: poll RaceFacer session-management on the SAME shared login, so the app + HK AI
+// know which karts are in which session (and their time windows). Write-on-change; prunes to 7 days.
+async function sessionsPoller(){
+  const sessions = require('./rf_sessions');
+  const SESS_POLL = Math.max(10, parseInt(process.env.RF_SESS_POLL_SEC || '20', 10)) * 1000;
+  let fails = 0;
+  await sleep(6000);                                // let the status poller establish the session first
+  while (!stopping){
+    const t0 = Date.now();
+    try {
+      await ensureLogin();
+      await sessions.syncSessions(sync.rfJson);
+      fails = 0;
+    } catch (e){
+      fails++;
+      if (/login|session|401|403/i.test(e.message || '')) dropLogin();
+      if (fails <= 3 || fails % 10 === 0) log(`sessions poll error (${fails}): ${e.message}`);
+      if (fails > 3) await sleep(Math.min(30000, fails * 1000));
+    }
+    await sleep(Math.max(0, SESS_POLL - (Date.now() - t0)));
+  }
+}
+
 // Status + notes: persistent in-process loops sharing ONE RaceFacer session.
 statusPoller().catch((e) => log(`status poller crashed: ${e.message}`));
 notesSweeper().catch((e) => log(`notes sweeper crashed: ${e.message}`));
+sessionsPoller().catch((e) => log(`sessions poller crashed: ${e.message}`));
 
 // Heavy: full reconcile (repairs, parts, prune, reconcile) in its own spawned process.
 const heavyLoop = loop('heavy', HEAVY_GAP, { STATUS_ONLY: '', NOTES_ONLY: '', HEAVY_INTERVAL_SEC: '60' });

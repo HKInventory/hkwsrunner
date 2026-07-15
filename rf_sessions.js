@@ -1,0 +1,219 @@
+/* HK Workshop — RaceFacer SESSIONS sync (rf_sessions.js)
+ * ------------------------------------------------------
+ * Mirrors RaceFacer session-management into Supabase so the app + HK AI can answer
+ * "which karts were in the 10:00 session" and scope BMS cell history to a session window.
+ *
+ * Flow (every RF_SESS_POLL_SEC, default 20s; shares the persistent RaceFacer session
+ * owned by index.js — caller ensures login and passes racefacer-sync's rfJson):
+ *   1. GET the day's schedule            -> extract session UUIDs (defensive parse)
+ *   2. GET detail for interesting UUIDs  -> /ajax/session-management/session?type=session&uuid=..&sub_track_id=..
+ *      (this response shape is CONFIRMED from a live capture: session_data{label,status,
+ *       scheduled_time_string,track_configuration,sub_track_id,runs.data[{client_name,kart,
+ *       kart_id,fleet_management_id,total_laps,best_lap,average_lap_time,last_lap,length,status}]})
+ *   3. Upsert rf_sessions + rf_session_runs (content-hashed — write only on change)
+ *   4. Every ~6h: prune rf_sessions / rf_session_runs / rimo_bms_history older than 7 days
+ *
+ * Bandwidth: fetches from RaceFacer are inbound (free on Render); Supabase writes are
+ * change-detected, so a quiet schedule costs ~nothing.
+ *
+ * Env: RF_SESS_POLL_SEC (20), RF_SUB_TRACKS ("4" — comma list), RF_SESS_SCHEDULE_PATH
+ *      (override if the schedule endpoint differs), SESSIONS=off kill switch.
+ */
+'use strict';
+
+const { createClient } = require('@supabase/supabase-js');
+const crypto = require('crypto');
+
+const SB_URL = process.env.SUPABASE_URL || process.env.SB_URL;
+const SB_KEY = process.env.SUPABASE_SERVICE_KEY || process.env.SB_SERVICE_KEY;
+const supa = (SB_URL && SB_KEY) ? createClient(SB_URL, SB_KEY, { auth: { persistSession: false } }) : null;
+const SITE = (process.env.SITE || 'sydney').trim().toLowerCase();
+const SUB_TRACKS = String(process.env.RF_SUB_TRACKS || '4').split(',').map(s => parseInt(s.trim(), 10)).filter(Number.isFinite);
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const sha = s => crypto.createHash('sha1').update(String(s)).digest('base64').slice(0, 20);
+
+let _schedPath = process.env.RF_SESS_SCHEDULE_PATH || null;   // learned once, reused
+let _sessHash = {};            // uuid -> content hash of last write
+let _doneFinished = {};        // uuid -> true once a FINISHED session has been stored (never refetch)
+let _lastPrune = 0;
+let _schedLogged = false, _failLogged = 0;
+
+function todayStr(){
+  // RaceFacer runs on venue-local dates; Sydney.
+  const p = new Intl.DateTimeFormat('en-CA', { timeZone: 'Australia/Sydney', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+  return p; // YYYY-MM-DD
+}
+
+/* Recursively collect anything in the schedule JSON that looks like a session
+   (an object carrying a UUID). Shape-agnostic on purpose — we only need the UUIDs
+   (+ sub_track_id/status when present); ALL real fields come from the detail call,
+   whose shape is confirmed. */
+function collectSessions(node, out, depth){
+  if (!node || depth > 8) return;
+  if (Array.isArray(node)){ for (const x of node) collectSessions(x, out, depth + 1); return; }
+  if (typeof node !== 'object') return;
+  const uuid = typeof node.uuid === 'string' && UUID_RE.test(node.uuid) ? node.uuid : null;
+  if (uuid && !out.some(s => s.uuid === uuid)){
+    out.push({
+      uuid,
+      status: String(node.status || node.session_status || ''),
+      sub_track_id: Number(node.sub_track_id) || null,
+      when: String(node.scheduled_time_string || node.schedule_time || node.scheduled_time || node.time || ''),
+    });
+  }
+  for (const k in node) if (node[k] && typeof node[k] === 'object') collectSessions(node[k], out, depth + 1);
+}
+
+async function fetchSchedule(rfJson, date){
+  const candidates = _schedPath ? [_schedPath] : [
+    '/ajax/session-management/sessions-schedule?date={d}&sub_track_id={st}',
+    '/ajax/session-management/sessions-schedule?date={d}',
+    '/ajax/session-management/sessions-schedule?date={d}&session_page=karting',
+    '/ajax/sessions-schedule?date={d}&sub_track_id={st}',
+    '/ajax/sessions-schedule?date={d}',
+  ];
+  for (const tmpl of candidates){
+    for (const st of SUB_TRACKS){
+      const path = tmpl.replace('{d}', date).replace('{st}', String(st));
+      try {
+        const j = await rfJson(path, 1);
+        if (!j) continue;
+        const out = [];
+        collectSessions(j, out, 0);
+        if (out.length){
+          if (!_schedPath){ _schedPath = tmpl; console.log(`[sessions] schedule endpoint locked: ${tmpl} (${out.length} sessions)`); }
+          if (!_schedLogged){ _schedLogged = true; console.log(`[sessions] schedule top-level keys: ${Object.keys(j).slice(0, 12).join(',')}`); }
+          return out;
+        }
+      } catch (e) { /* try next */ }
+      if (!tmpl.includes('{st}')) break;   // no per-track variant — one try is enough
+    }
+  }
+  if (_failLogged++ < 3) console.log(`[sessions] could not find the schedule endpoint for ${date} — paste the sessions-schedule Response and set RF_SESS_SCHEDULE_PATH`);
+  return [];
+}
+
+function parseLapMins(runs){
+  let m = 0;
+  for (const r of runs) { const n = Number(r.length); if (Number.isFinite(n) && n > m) m = n; }
+  return m || 10;   // slot_time on the page is 10 min
+}
+
+async function fetchDetail(rfJson, uuid, subTrack){
+  for (const st of (subTrack ? [subTrack] : SUB_TRACKS)){
+    try {
+      const j = await rfJson(`/ajax/session-management/session?type=session&uuid=${uuid}&sub_track_id=${st}`, 1);
+      const sd = j && (j.session_data || j.session || j.data);
+      if (sd && (sd.uuid || sd.label || sd.runs)) return sd;
+    } catch (e) { /* try next sub-track */ }
+  }
+  return null;
+}
+
+function rowsFromDetail(sd, uuid){
+  const runsIn = (sd.runs && (sd.runs.data || sd.runs)) || [];
+  const runs = Array.isArray(runsIn) ? runsIn : [];
+  const startStr = sd.scheduled_time_string || sd.scheduled_time || '';
+  // "2026-07-14 17:00:00" is venue-local (Sydney) — attach the offset via Intl round-trip.
+  let scheduled_at = null, ends_at = null;
+  if (startStr){
+    const m = String(startStr).match(/(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?/);
+    if (m){
+      // Interpret as Australia/Sydney wall time: find the UTC instant whose Sydney rendering matches.
+      const guess = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0));
+      for (const offH of [10, 11, 9]){   // AEST/AEDT candidates
+        const t = guess - offH * 3600000;
+        const back = new Intl.DateTimeFormat('en-CA', { timeZone: 'Australia/Sydney', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(t));
+        if (back === `${m[1]}-${m[2]}-${m[3]}, ${m[4]}:${m[5]}`){ scheduled_at = new Date(t).toISOString(); break; }
+      }
+      if (!scheduled_at) scheduled_at = new Date(guess - 10 * 3600000).toISOString();
+      ends_at = new Date(Date.parse(scheduled_at) + (parseLapMins(runs) + 3) * 60000).toISOString();   // +3 min buffer
+    }
+  }
+  const sess = {
+    uuid,
+    rf_session_id: Number(sd.id) || null,
+    label: String(sd.label || sd.name || ''),
+    status: String(sd.status || ''),
+    track: String(sd.track_configuration || sd.track || ''),
+    sub_track_id: Number(sd.sub_track_id) || null,
+    scheduled_at, ends_at,
+    site: SITE,
+    updated_at: new Date().toISOString(),
+  };
+  const runRows = [];
+  for (const r of runs){
+    const rid = Number(r.id || r.run_id); if (!Number.isFinite(rid)) continue;
+    const kart = r.kart != null ? r.kart : (r.kart_label != null ? r.kart_label : r.kart_no);
+    runRows.push({
+      run_id: rid,
+      session_uuid: uuid,
+      client_name: String(r.client_name || r.client || r.name || ''),
+      kart_no: String(kart != null ? kart : ''),
+      rf_kart_id: Number(r.kart_id) || null,
+      fleet_management_id: (r.fleet_management_id != null ? String(r.fleet_management_id) : null),
+      total_laps: Number(r.total_laps) || 0,
+      best_lap: String(r.best_lap || ''),
+      avg_lap: String(r.average_lap_time || r.avg_lap || ''),
+      last_lap: String(r.last_lap || ''),
+      status: String(r.status || ''),
+      updated_at: new Date().toISOString(),
+    });
+  }
+  return { sess, runRows };
+}
+
+async function pruneOld(){
+  if (Date.now() - _lastPrune < 6 * 3600000) return;
+  _lastPrune = Date.now();
+  const cutoff = new Date(Date.now() - 7 * 86400000).toISOString();
+  try {
+    const { data: old } = await supa.from('rf_sessions').select('uuid').lt('scheduled_at', cutoff).limit(500);
+    const uuids = (old || []).map(s => s.uuid);
+    if (uuids.length){
+      await supa.from('rf_session_runs').delete().in('session_uuid', uuids);
+      await supa.from('rf_sessions').delete().in('uuid', uuids);
+    }
+    await supa.from('rimo_bms_history').delete().lt('at', cutoff);
+    console.log(`[sessions] 7-day prune done (${uuids.length} old sessions, BMS history < ${cutoff.slice(0, 10)})`);
+  } catch (e) { console.error('[sessions] prune:', e.message || e); }
+}
+
+async function syncSessions(rfJson){
+  if (!supa || process.env.SESSIONS === 'off') return;
+  const date = todayStr();
+  const list = await fetchSchedule(rfJson, date);
+  if (!list.length) return;
+  const now = Date.now();
+  // Which sessions deserve a detail fetch this cycle: live ones, near-term ones, and
+  // anything we haven't stored yet. Finished + already-stored sessions are never refetched.
+  const wanted = list.filter(s => {
+    if (_doneFinished[s.uuid]) return false;
+    const st = (s.status || '').toLowerCase();
+    if (st.includes('progress')) return true;
+    return true;                          // not-yet-final: sync it (cheap; write-on-change)
+  }).slice(0, 15);
+  let wrote = 0;
+  for (const s of wanted){
+    const sd = await fetchDetail(rfJson, s.uuid, s.sub_track_id);
+    if (!sd) continue;
+    const { sess, runRows } = rowsFromDetail(sd, s.uuid);
+    const h = sha(JSON.stringify(sess) + JSON.stringify(runRows));
+    const finished = /finish|complete|closed|ended/i.test(sess.status);
+    if (_sessHash[s.uuid] === h){ if (finished) _doneFinished[s.uuid] = true; continue; }
+    _sessHash[s.uuid] = h;
+    const { error: e1 } = await supa.from('rf_sessions').upsert(sess, { onConflict: 'uuid' });
+    if (e1){ if (!/relation|does not exist/i.test(e1.message)) console.error('[sessions] upsert:', e1.message); return; }
+    if (runRows.length){
+      const { error: e2 } = await supa.from('rf_session_runs').upsert(runRows, { onConflict: 'run_id' });
+      if (e2) console.error('[sessions] runs upsert:', e2.message);
+    }
+    if (finished) _doneFinished[s.uuid] = true;
+    wrote++;
+  }
+  if (wrote) console.log(`[sessions] ${wrote} session(s) written (${list.length} on today's schedule)`);
+  await pruneOld();
+}
+
+module.exports = { syncSessions };
