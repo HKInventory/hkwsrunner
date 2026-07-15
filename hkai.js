@@ -24,7 +24,7 @@ const supa = (SB_URL && SB_KEY) ? createClient(SB_URL, SB_KEY, { auth: { persist
 
 const API_KEY = process.env.ANTHROPIC_API_KEY || '';
 const MODEL = process.env.AI_MODEL || 'claude-sonnet-4-6';
-const MAX_TOKENS = Math.max(256, parseInt(process.env.AI_MAX_TOKENS || '1200', 10));
+const MAX_TOKENS = Math.max(256, parseInt(process.env.AI_MAX_TOKENS || '2000', 10));
 const CAP_USD = Math.max(1, parseFloat(process.env.AI_MONTHLY_CAP_USD || '20'));
 // Sonnet pricing: $3/M input, $15/M output
 const COST = (tin, tout) => tin * 3e-6 + tout * 15e-6;
@@ -56,21 +56,48 @@ async function gatherContext(row){
   const nowIso = new Date().toISOString();
   S.push(`NOW: ${syd(nowIso)} (Sydney time). Site: ${site}.`);
 
-  // Fleet
+  // Fleet — full list with status
   const karts = await q('rf_karts', b => b.select('rf_id,name,type,status,long_term').eq('site', site).limit(400));
+  const byRf = {}; karts.forEach(k => { byRf[k.rf_id] = k; });
+  const statusOf = k => k.long_term ? 'LONG-TERM' : (k.status === 'damaged' ? 'DAMAGED' : (k.status === 'maint' || k.status === 'for_maintenance' ? 'FOR-MAINTENANCE' : 'OK'));
   if (karts.length){
-    S.push('FLEET (kart / type / status):');
-    S.push(karts.map(k => `${k.name} ${k.type || ''} ${k.long_term ? 'LONG-TERM' : (k.status || '')}`.trim()).join(' | '));
+    S.push(`FLEET — ${karts.length} karts (number · type · status):`);
+    S.push(karts.map(k => `${k.name} ${k.type || ''} ${statusOf(k)}`.trim()).join(' | '));
   }
-  const byName = {}; karts.forEach(k => { byName[String(k.name)] = k; });
 
-  // Open notes
-  const notes = await q('rf_kart_notes', b => b.select('rf_kart_id,note,created_by,created_at').eq('active', true).order('created_at', { ascending: false }).limit(100));
-  if (notes.length){
-    const byRf = {}; karts.forEach(k => { byRf[k.rf_id] = k.name; });
-    S.push('OPEN KART NOTES (kart: note — by, when):');
-    S.push(notes.map(n => `Kart ${byRf[n.rf_kart_id] || n.rf_kart_id}: ${String(n.note).slice(0, 120)} — ${n.created_by || '?'}, ${syd(n.created_at)}`).join('\n'));
+  // ALL open kart notes (page past PostgREST's 1000-row cap so nothing is missed — this is what
+  // makes "how many karts with a WiFi/CPU note" accurate rather than a capped guess).
+  let notes = [];
+  try {
+    const PAGE = 1000;
+    for (let from = 0; ; from += PAGE) {
+      const chunk = await q('rf_kart_notes', b => b.select('rf_kart_id,note,created_by,created_at').eq('active', true).order('created_at', { ascending: false }).range(from, from + PAGE - 1));
+      if (!chunk.length) break; notes = notes.concat(chunk); if (chunk.length < PAGE) break;
+    }
+  } catch (e) {}
+  const notesByKart = {};
+  notes.forEach(n => { (notesByKart[n.rf_kart_id] = notesByKart[n.rf_kart_id] || []).push(n); });
+
+  // OUT-OF-ACTION list: every DAMAGED or LONG-TERM kart, each WITH its open notes pre-attached.
+  // This is the authoritative set for "how many karts are damaged / have X issue" questions —
+  // the model should count from here, not reconstruct it from the fleet + notes fragments.
+  const outKarts = karts.filter(k => k.long_term || k.status === 'damaged').sort((a, b) => (parseInt(a.name, 10) || 0) - (parseInt(b.name, 10) || 0));
+  if (outKarts.length){
+    S.push(`OUT-OF-ACTION KARTS — ${outKarts.length} total (DAMAGED or LONG-TERM). Each kart with its open notes. COUNT FROM THIS LIST for "how many" questions:`);
+    S.push(outKarts.map(k => {
+      const ns = (notesByKart[k.rf_id] || []).map(n => `"${String(n.note).replace(/\s+/g, ' ').trim()}" (${n.created_by || '?'}, ${syd(n.created_at)})`);
+      return `Kart ${k.name} [${statusOf(k)}]${k.type ? ' ' + k.type : ''} — notes: ${ns.length ? ns.join('; ') : 'none'}`;
+    }).join('\n'));
   }
+
+  // Open notes on OK/maintenance karts too (so nothing is hidden), briefer
+  const otherNoted = karts.filter(k => !k.long_term && k.status !== 'damaged' && (notesByKart[k.rf_id] || []).length);
+  if (otherNoted.length){
+    S.push(`OTHER KARTS WITH OPEN NOTES (${otherNoted.length}, status OK/maintenance):`);
+    S.push(otherNoted.map(k => `Kart ${k.name} [${statusOf(k)}]: ${(notesByKart[k.rf_id] || []).map(n => `"${String(n.note).replace(/\s+/g, ' ').trim()}"`).join('; ')}`).join('\n'));
+  }
+  S.push(`NOTE TOTALS: ${notes.length} open notes across ${Object.keys(notesByKart).length} karts; ${outKarts.length} karts are DAMAGED or LONG-TERM.`);
+  const byName = {}; karts.forEach(k => { byName[String(k.name)] = k; });
 
   // Recent repairs (14 days) + full history for any kart the question names
   const since14 = new Date(Date.now() - 14 * 86400000).toISOString().slice(0, 10);
@@ -240,7 +267,19 @@ async function processRow(row){
     (prior || []).reverse().forEach(p => { if (p.answer){ messages.push({ role: 'user', content: p.question }); messages.push({ role: 'assistant', content: p.answer }); } });
     messages.push({ role: 'user', content: row.question });
 
-    const system = `You are HK AI, the Hyper Karting Sydney workshop assistant, answering questions for staff inside the HK Workshop app. Answer ONLY from the CONTEXT below — it is live data from the workshop's systems (RaceFacer, RiMO, the app's own tables). If the context doesn't contain the answer, say so plainly and say what data would be needed; never invent karts, repairs, people, sessions or readings. Be concise and direct — a busy mechanic is reading on a phone. Use Sydney time. Cell names are L1–L8 (left) and R1–R8 (right); a healthy cell sits ~3.2–3.6V, a dead/sagging cell drops well below the others under load. You are read-only: you cannot change anything, only answer.\n\nCONTEXT:\n${context}`;
+    const system = `You are HK AI, the Hyper Karting Sydney workshop assistant, answering questions for staff inside the HK Workshop app. Answer ONLY from the CONTEXT below — it is live data from the workshop's systems (RaceFacer, RiMO, the app's own tables). If the context doesn't contain the answer, say so plainly and say what data would be needed; never invent karts, repairs, people, sessions or readings.
+
+COUNTING & COMPLETENESS RULES (important — do not undercount):
+- For "how many karts" questions, count EVERY matching kart in the OUT-OF-ACTION KARTS list (and OTHER KARTS WITH OPEN NOTES if relevant). Read the WHOLE list to the end before answering — do not stop early or summarise a subset.
+- A kart is "out of action" if its status is DAMAGED or LONG-TERM. Treat both as out of action unless the user asks for one specifically.
+- For "karts with a WiFi chip / CPU issue" (or any issue type), scan the notes text of every OUT-OF-ACTION kart for that topic and count all matches. WiFi-chip and CPU/motherboard wording ("wifi chip", "wifi stack", "cpu", "motherboard", "no lap times", "both LEDs") often describe the same class of fault — include them all.
+- If a kart appears in the OUT-OF-ACTION list with "notes: none", it is still DAMAGED/LONG-TERM — its status counts even without a note. Only say "no notes" about the NOTES, never imply the kart is fine.
+- When giving a count, state the number first, then list the karts. Re-check your list length matches your stated count.
+
+Be concise and direct — a busy mechanic is reading on a phone. Use Sydney time. Cell names are L1–L8 (left) and R1–R8 (right); a healthy cell sits ~3.2–3.6V, a dead/sagging cell drops well below the others under load. You are read-only: you cannot change anything, only answer.
+
+CONTEXT:
+${context}`;
 
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
