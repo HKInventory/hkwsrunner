@@ -351,10 +351,10 @@ async function enumerateKarts() {
 }
 
 // ---- Supabase REST helpers (service role) ----
-async function sb(path, { method = 'GET', body, prefer } = {}) {
+async function sb(path, { method = 'GET', body, prefer, headers } = {}) {
   const res = await fetch(`${SB_URL}/rest/v1/${path}`, {
     method,
-    headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`, 'Content-Type': 'application/json', ...(prefer ? { Prefer: prefer } : {}) },
+    headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`, 'Content-Type': 'application/json', ...(prefer ? { Prefer: prefer } : {}), ...(headers || {}) },
     body: body ? JSON.stringify(body) : undefined,
   });
   const text = await res.text();
@@ -465,15 +465,25 @@ async function syncAllRepairs() {
   // Render meters the worker's OUTBOUND bytes; upserting every repair (and wiping/rebuilding
   // every part line) each heavy pass was the biggest remaining GB source. Read the existing
   // id->fingerprint map from Supabase (inbound = free on Render) and write only new/changed rows.
+  //
+  // CRITICAL: PostgREST caps a response at 1000 rows. With ~19k repairs, a plain select returned
+  // only the first 1000 fingerprints, so the other ~18k always looked "changed" and got rewritten
+  // EVERY heavy cycle (the 500-600 MB/hr bandwidth leak). Page through ALL rows via Range headers.
   let existing = new Map();
   try {
-    const cur = await sb('rf_repairs?select=id,fingerprint');
-    for (const r of (cur || [])) existing.set(Number(r.id), r.fingerprint || '');
+    const PAGE = 1000;
+    for (let from = 0; ; from += PAGE) {
+      const chunk = await sb('rf_repairs?select=id,fingerprint', { headers: { Range: `${from}-${from + PAGE - 1}`, 'Range-Unit': 'items' } });
+      if (!chunk || !chunk.length) break;
+      for (const r of chunk) existing.set(Number(r.id), r.fingerprint || '');
+      if (chunk.length < PAGE) break;
+    }
+    console.log(`[repairs] fingerprint map: ${existing.size} existing rows read`);
   } catch (e) { console.error('[repairs] fingerprint pre-read failed (writing all):', (e.message || '').slice(0, 100)); }
 
   const repairRows = [], partRows = [], changedIds = [];
   for (const { row, parts } of byId.values()) {
-    if (existing.size && existing.get(Number(row.id)) === row.fingerprint) continue;   // unchanged — skip entirely
+    if (existing.has(Number(row.id)) && existing.get(Number(row.id)) === row.fingerprint) continue;   // unchanged — skip entirely
     repairRows.push(row);
     changedIds.push(row.id);
     for (const p of parts) partRows.push({ repair_id: row.id, part_name: p.name, qty: p.qty, price: p.price });
