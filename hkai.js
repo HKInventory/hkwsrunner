@@ -239,6 +239,127 @@ function bmsAnalysis(rows){
 }
 
 /* ── the answer path ───────────────────────────────────────────────────── */
+/* ── TOOLS the AI can call on demand ────────────────────────────────────────
+   The always-on context (fleet + out-of-action list) covers status questions cheaply.
+   For anything deeper — repairs by a person, a date range, full history, session cell data —
+   the model calls these tools and the runner runs the query. Repairs/notes/sessions return full
+   history (text, cheap). BMS returns a SUMMARY, never thousands of raw rows (the Session Data
+   screen is where raw 0.5s traces are browsed). */
+const TOOLS = [
+  { name: 'query_repairs', description: 'Search repair records across ALL history. Filter by mechanic name, kart number, date range, and/or a keyword in the description. Returns matching repairs (capped at 300, newest first) with date, kart, mechanic and description. Use for "how many repairs did X do", "what was repaired on kart N", "repairs in <month>", etc.',
+    input_schema: { type: 'object', properties: {
+      mechanic: { type: 'string', description: 'Mechanic name or part of it (case-insensitive), e.g. "Jayden"' },
+      kart_no: { type: 'string', description: 'Kart number, e.g. "43"' },
+      from: { type: 'string', description: 'Start date inclusive, YYYY-MM-DD' },
+      to: { type: 'string', description: 'End date inclusive, YYYY-MM-DD' },
+      keyword: { type: 'string', description: 'Word to find in the repair description, e.g. "tyre", "wifi", "brake"' },
+      count_only: { type: 'boolean', description: 'If true, return just the total count (use for "how many")' },
+    } } },
+  { name: 'search_notes', description: 'Search kart notes (open by default) across the fleet by keyword and/or kart number. Returns matching notes with kart, text, author and date.',
+    input_schema: { type: 'object', properties: {
+      keyword: { type: 'string', description: 'Word to find in the note text, e.g. "wifi", "cpu", "tyre"' },
+      kart_no: { type: 'string', description: 'Kart number' },
+      include_archived: { type: 'boolean', description: 'Also search resolved/archived notes (default false)' },
+    } } },
+  { name: 'list_sessions', description: 'List recent sessions (last 7 days) with their time, track, status and the karts+drivers that were in each. Use to find a session before asking about its karts or cell data.',
+    input_schema: { type: 'object', properties: {
+      day: { type: 'string', description: '"today", "yesterday", or a date YYYY-MM-DD (optional)' },
+      kart_no: { type: 'string', description: 'Only sessions that included this kart (optional)' },
+    } } },
+  { name: 'bms_session_summary', description: 'Battery/cell health SUMMARY for one kart in one session (or a time window). Returns per-cell first→last/min voltages, the worst-sagging cell, any fault flags, and a short SOC/pack timeline. Does NOT return every 0.5s row — for the full raw trace, tell the user to open the Session Data screen. Use for "which cell died", "was kart N\'s battery ok in the X session".',
+    input_schema: { type: 'object', properties: {
+      kart_no: { type: 'string', description: 'Kart number, required' },
+      session_time: { type: 'string', description: 'Session label/time like "10:00" or "5pm" (optional if you give from/to)' },
+      day: { type: 'string', description: '"today" or "yesterday" (default today)' },
+      from: { type: 'string', description: 'ISO start of window (optional alternative to session_time)' },
+      to: { type: 'string', description: 'ISO end of window (optional)' },
+    }, required: ['kart_no'] } },
+];
+
+async function pageAll(table, apply, cap){
+  // page past PostgREST's 1000-row cap up to `cap` rows
+  let out = [], from = 0; const PAGE = 1000;
+  while (out.length < (cap || 20000)){
+    const rows = await q(table, b => apply(b).range(from, from + PAGE - 1));
+    if (!rows.length) break; out = out.concat(rows); if (rows.length < PAGE) break; from += PAGE;
+  }
+  return out;
+}
+
+async function runTool(name, args, site){
+  args = args || {};
+  if (name === 'query_repairs'){
+    const rows = await pageAll('rf_repairs', b => {
+      let bb = b.select('kart_name,date_discovered,date_repaired,mechanic,description');
+      if (args.mechanic) bb = bb.ilike('mechanic', `%${args.mechanic}%`);
+      if (args.kart_no) bb = bb.eq('kart_name', String(args.kart_no));
+      if (args.from) bb = bb.or(`date_repaired.gte.${args.from},date_discovered.gte.${args.from}`);
+      if (args.to) bb = bb.or(`date_repaired.lte.${args.to},date_discovered.lte.${args.to}`);
+      return bb.order('id', { ascending: false });
+    }, 5000);
+    let filtered = rows;
+    if (args.keyword){ const k = args.keyword.toLowerCase(); filtered = rows.filter(r => String(r.description || '').toLowerCase().includes(k)); }
+    if (args.from){ filtered = filtered.filter(r => (r.date_repaired || r.date_discovered || '') >= args.from); }
+    if (args.to){ filtered = filtered.filter(r => (r.date_repaired || r.date_discovered || '9999') <= args.to); }
+    if (args.count_only) return `COUNT: ${filtered.length} repair(s) match.`;
+    const list = filtered.slice(0, 300).map(r => `${r.date_repaired || r.date_discovered || '?'} · Kart ${r.kart_name} · ${r.mechanic || '?'}: ${String(r.description || '').slice(0, 140)}`);
+    return `${filtered.length} repair(s) match${filtered.length > 300 ? ' (showing first 300)' : ''}:\n` + list.join('\n');
+  }
+  if (name === 'search_notes'){
+    const rows = await pageAll('rf_kart_notes', b => {
+      let bb = b.select('rf_kart_id,note,created_by,created_at,active');
+      if (!args.include_archived) bb = bb.eq('active', true);
+      return bb.order('created_at', { ascending: false });
+    }, 8000);
+    // map kart id -> number
+    const karts = await q('rf_karts', b => b.select('rf_id,name').eq('site', site).limit(400));
+    const numOf = {}; karts.forEach(k => { numOf[k.rf_id] = k.name; });
+    let filtered = rows;
+    if (args.kart_no) filtered = filtered.filter(r => String(numOf[r.rf_kart_id]) === String(args.kart_no));
+    if (args.keyword){ const k = args.keyword.toLowerCase(); filtered = filtered.filter(r => String(r.note || '').toLowerCase().includes(k)); }
+    if (!filtered.length) return 'No matching notes.';
+    return `${filtered.length} note(s) match:\n` + filtered.slice(0, 200).map(r => `Kart ${numOf[r.rf_kart_id] || r.rf_kart_id}${r.active ? '' : ' [resolved]'}: "${String(r.note).replace(/\s+/g, ' ').trim()}" — ${r.created_by || '?'}, ${syd(r.created_at)}`).join('\n');
+  }
+  if (name === 'list_sessions'){
+    const since = new Date(Date.now() - 7 * 86400000).toISOString();
+    let sess = await q('rf_sessions', b => b.select('uuid,label,status,track,scheduled_at,ends_at').gte('scheduled_at', since).order('scheduled_at', { ascending: false }).limit(80));
+    if (args.day === 'today' || args.day === 'yesterday'){
+      const d = new Intl.DateTimeFormat('en-CA', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(Date.now() - (args.day === 'yesterday' ? 86400000 : 0)));
+      sess = sess.filter(s => new Intl.DateTimeFormat('en-CA', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(s.scheduled_at)) === d);
+    } else if (args.day && /^\d{4}-\d{2}-\d{2}$/.test(args.day)){
+      sess = sess.filter(s => new Intl.DateTimeFormat('en-CA', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(s.scheduled_at)) === args.day);
+    }
+    if (!sess.length) return 'No sessions found in that range.';
+    const runs = await q('rf_session_runs', b => b.select('session_uuid,client_name,kart_no,total_laps,best_lap').in('session_uuid', sess.map(s => s.uuid)).limit(800));
+    const by = {}; runs.forEach(r => { (by[r.session_uuid] = by[r.session_uuid] || []).push(r); });
+    let list = sess;
+    if (args.kart_no) list = sess.filter(s => (by[s.uuid] || []).some(r => String(r.kart_no) === String(args.kart_no)));
+    return list.map(s => {
+      const rr = (by[s.uuid] || []).map(r => `K${r.kart_no} ${r.client_name}`).join(', ');
+      return `${s.label} · ${s.track} · ${syd(s.scheduled_at)}–${sydT(s.ends_at)} · ${s.status} · karts: ${rr || 'none'}`;
+    }).join('\n');
+  }
+  if (name === 'bms_session_summary'){
+    if (!args.kart_no) return 'kart_no is required.';
+    // find sessions for the day, match by time, get window + serial
+    const since = new Date(Date.now() - 8 * 86400000).toISOString();
+    const sess = await q('rf_sessions', b => b.select('uuid,label,scheduled_at,ends_at').gte('scheduled_at', since).order('scheduled_at', { ascending: false }).limit(80));
+    const sessRuns = sess.length ? await q('rf_session_runs', b => b.select('session_uuid,kart_no,fleet_management_id').in('session_uuid', sess.map(s => s.uuid)).limit(800)) : [];
+    const q2 = `${args.session_time || ''} kart ${args.kart_no}`;
+    let target;
+    if (args.from) target = { kart: args.kart_no, serial: null, from: args.from, to: args.to || new Date().toISOString(), label: '' };
+    else target = await resolveBmsTarget(q2, parseInt(args.kart_no, 10), sess, sessRuns);
+    if (!target) return `Couldn't find a session matching that for kart ${args.kart_no}.`;
+    const rows = await q('rimo_bms_history', b => {
+      let bb = b.select('at,soc,pack_v,avg_v,current_a,cells,faults').gte('at', target.from).lte('at', target.to).order('at', { ascending: true }).limit(4000);
+      return target.serial ? bb.eq('serial_no', target.serial) : bb.eq('kart_no', parseInt(args.kart_no, 10));
+    });
+    if (!rows.length) return `No BMS cell data logged for kart ${args.kart_no} in that window (${syd(target.from)}–${sydT(target.to)}). The logger records while a kart is in a session and keeps 7 days — there may be no session then, or the logger wasn't running.`;
+    return `Kart ${args.kart_no}${target.label ? ' · session "' + target.label + '"' : ''} · ${syd(target.from)}–${sydT(target.to)} · ${rows.length} samples:\n` + bmsAnalysis(rows) + `\n(For the full 0.5s trace of every cell, open the Session Data screen.)`;
+  }
+  return 'Unknown tool.';
+}
+
 async function monthUsage(){
   const month = new Date().toISOString().slice(0, 7);
   try { const { data } = await supa.from('ai_usage').select('*').eq('month', month).limit(1); return (data && data[0]) || { month, questions: 0, tokens_in: 0, tokens_out: 0, est_cost_usd: 0 }; }
@@ -267,34 +388,52 @@ async function processRow(row){
     (prior || []).reverse().forEach(p => { if (p.answer){ messages.push({ role: 'user', content: p.question }); messages.push({ role: 'assistant', content: p.answer }); } });
     messages.push({ role: 'user', content: row.question });
 
-    const system = `You are HK AI, the Hyper Karting Sydney workshop assistant, answering questions for staff inside the HK Workshop app. Answer ONLY from the CONTEXT below — it is live data from the workshop's systems (RaceFacer, RiMO, the app's own tables). If the context doesn't contain the answer, say so plainly and say what data would be needed; never invent karts, repairs, people, sessions or readings.
+    const system = `You are HK AI, the Hyper Karting Sydney workshop assistant, answering questions for staff inside the HK Workshop app. You answer from live workshop data (RaceFacer, RiMO, the app's own tables).
 
-COUNTING & COMPLETENESS RULES (important — do not undercount):
-- For "how many karts" questions, count EVERY matching kart in the OUT-OF-ACTION KARTS list (and OTHER KARTS WITH OPEN NOTES if relevant). Read the WHOLE list to the end before answering — do not stop early or summarise a subset.
-- A kart is "out of action" if its status is DAMAGED or LONG-TERM. Treat both as out of action unless the user asks for one specifically.
-- For "karts with a WiFi chip / CPU issue" (or any issue type), scan the notes text of every OUT-OF-ACTION kart for that topic and count all matches. WiFi-chip and CPU/motherboard wording ("wifi chip", "wifi stack", "cpu", "motherboard", "no lap times", "both LEDs") often describe the same class of fault — include them all.
-- If a kart appears in the OUT-OF-ACTION list with "notes: none", it is still DAMAGED/LONG-TERM — its status counts even without a note. Only say "no notes" about the NOTES, never imply the kart is fine.
-- When giving a count, state the number first, then list the karts. Re-check your list length matches your stated count.
+You have an always-on snapshot below (fleet + out-of-action karts + live RiMO). For ANYTHING it doesn't cover — repairs by a person, repairs in a date range, full repair/note history, older sessions, or battery cell data — CALL A TOOL to fetch it. Do not answer "I only have recent data": use query_repairs / search_notes / list_sessions / bms_session_summary to get exactly what's needed. The tools cover ALL history.
 
-Be concise and direct — a busy mechanic is reading on a phone. Use Sydney time. Cell names are L1–L8 (left) and R1–R8 (right); a healthy cell sits ~3.2–3.6V, a dead/sagging cell drops well below the others under load. You are read-only: you cannot change anything, only answer.
+RULES:
+- Never invent karts, repairs, people, sessions or readings. If a tool returns nothing, say so plainly.
+- For "how many" questions, use the tool (query_repairs with count_only, or search_notes) rather than eyeballing — then state the number, then list.
+- A kart is "out of action" if DAMAGED or LONG-TERM; treat both as out of action unless asked otherwise. A kart with no note is still out of action if its status says so — never imply it's fine.
+- For battery/cell questions, bms_session_summary gives the diagnosis (worst-sagging cell etc.). For a full 0.5s trace of every cell, tell the user to open the Session Data screen — don't try to list thousands of readings.
+- Be concise and direct — a busy mechanic is reading on a phone. Use Sydney time. Cells are L1–L8 (left) / R1–R8 (right); healthy ~3.2–3.6V, a dead cell sags well below the others under load. You are read-only.
 
-CONTEXT:
+ALWAYS-ON SNAPSHOT:
 ${context}`;
 
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: MODEL, max_tokens: MAX_TOKENS, system, messages }),
-      signal: AbortSignal.timeout(60000),
-    });
-    const j = await r.json().catch(() => null);
-    if (!r.ok || !j || !j.content){
-      const msg = (j && j.error && j.error.message) || `API error ${r.status}`;
-      await finish({ status: 'error', error: String(msg).slice(0, 300) });
-      return;
+    let tin = 0, tout = 0, answer = '', guard = 0;
+    while (guard++ < 6){
+      const r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({ model: MODEL, max_tokens: MAX_TOKENS, system, tools: TOOLS, messages }),
+        signal: AbortSignal.timeout(90000),
+      });
+      const j = await r.json().catch(() => null);
+      if (!r.ok || !j || !j.content){
+        const msg = (j && j.error && j.error.message) || `API error ${r.status}`;
+        await finish({ status: 'error', error: String(msg).slice(0, 300) });
+        return;
+      }
+      tin += (j.usage && j.usage.input_tokens) || 0;
+      tout += (j.usage && j.usage.output_tokens) || 0;
+      answer = (j.content || []).filter(c => c.type === 'text').map(c => c.text).join('\n').trim();
+      const toolUses = (j.content || []).filter(c => c.type === 'tool_use');
+      if (!toolUses.length || j.stop_reason !== 'tool_use') break;   // done — no more tools requested
+      // run each requested tool, feed results back
+      messages.push({ role: 'assistant', content: j.content });
+      const results = [];
+      for (const tu of toolUses){
+        let out;
+        try { out = await runTool(tu.name, tu.input, row.site || 'sydney'); }
+        catch (e){ out = `Tool error: ${(e.message || e)}`.slice(0, 300); }
+        console.log(`[ai] #${row.id} tool ${tu.name}(${JSON.stringify(tu.input).slice(0, 80)}) -> ${String(out).length} chars`);
+        results.push({ type: 'tool_result', tool_use_id: tu.id, content: String(out).slice(0, 12000) });
+      }
+      messages.push({ role: 'user', content: results });
     }
-    const answer = (j.content || []).filter(c => c.type === 'text').map(c => c.text).join('\n').trim() || '(no answer)';
-    const tin = (j.usage && j.usage.input_tokens) || 0, tout = (j.usage && j.usage.output_tokens) || 0;
+    answer = answer || '(no answer)';
     await finish({ status: 'done', answer, tokens_in: tin, tokens_out: tout });
     // usage counter (read-modify-write is fine at this volume)
     const u = await monthUsage();
@@ -305,7 +444,7 @@ ${context}`;
       tokens_out: (Number(u.tokens_out) || 0) + tout,
       est_cost_usd: Math.round(((Number(u.est_cost_usd) || 0) + COST(tin, tout)) * 10000) / 10000,
     }, { onConflict: 'month' });
-    console.log(`[ai] #${row.id} answered (${tin}in/${tout}out, ~$${COST(tin, tout).toFixed(4)}) — "${String(row.question).slice(0, 60)}"`);
+    console.log(`[ai] #${row.id} answered (${tin}in/${tout}out, ~$${COST(tin, tout).toFixed(4)}, ${guard - 1} round(s)) — "${String(row.question).slice(0, 60)}"`);
   } catch (e){
     await finish({ status: 'error', error: String(e.message || e).slice(0, 300) });
     console.error('[ai]', e.message || e);
