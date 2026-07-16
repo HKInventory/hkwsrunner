@@ -292,7 +292,7 @@ function _histResolve(k){
   if (byNo) return { id: byNo.id, serial: byNo.serial, via: 'kart_no' };
   return null;
 }
-function _histRowOf(bms, serial, kartNo){
+function _histRowOf(bms, serial, kartNo, online){
   const num = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : null; };
   const cells = [];
   for (const side of ['Left', 'Right']) for (let i = 1; i <= 8; i++) cells.push(num(bms[`cell${i}Voltage${side}`]));
@@ -303,6 +303,7 @@ function _histRowOf(bms, serial, kartNo){
     serial_no: serial, kart_no: kartNo, at: new Date().toISOString(),
     soc: num(bms.socLeft), pack_v: num(bms.voltageLeft), avg_v: num(bms.voltageRight),
     current_a: num(bms.actualCurrent), cells,
+    online: online ? 1 : 0,
     faults: Object.keys(faults).length ? faults : null,
   };
 }
@@ -326,7 +327,7 @@ async function historySweep(){
       const got = await Promise.all(batch.map(t => fetchKartBms(t.id).then(b => ({ t, b })).catch(() => ({ t, b: null }))));
       for (const { t, b } of got){
         if (!b) continue;
-        const row = _histRowOf(b, t.serial, t.kart_no);
+        const row = _histRowOf(b, t.serial, t.kart_no, (_byKartNo[t.kart_no] && _byKartNo[t.kart_no].online));
         const sig = JSON.stringify([row.cells, row.soc, row.current_a, row.pack_v]);
         if (_histSig[t.serial] === sig) continue;   // no cell/soc/current movement -> no write
         _histSig[t.serial] = sig;
