@@ -133,7 +133,7 @@ let _byKartNo = {};                                  // kart_no -> {id, serial, 
 let _byKartTrack = {};                                // "num|track" -> {id, serial, online, track} — exact when numbers duplicate
 // Normalise RaceFacer/RiMO track names to a common token so "Intermediate Track" == "intermediate".
 function _normTrack(t){ t = String(t || '').toLowerCase(); if (/inter/.test(t)) return 'inter'; if (/adult/.test(t)) return 'adult'; if (/junior/.test(t)) return 'junior'; if (/mini/.test(t)) return 'mini'; if (/twin/.test(t)) return 'twin'; if (/melb/.test(t)) return 'melb'; if (/cadet/.test(t)) return 'cadet'; return t.replace(/[^a-z0-9]/g, ''); }
-let _histRunning = false, _histSig = {}, _histActive = { at: 0, karts: [] }, _histLinkLogged = false;
+let _histRunning = false, _histSig = {}, _histActive = { at: 0, karts: [] }, _histLinkLogged = false, _histSessLogged = '';
 // kartdata.php returns XML like <data><tag><![CDATA[value]]></tag>…</data>. Pull every leaf field.
 function parseKartData(xml){
   const inner = (String(xml).match(/<data>([\s\S]*)<\/data>/i) || [null, String(xml)])[1];
@@ -254,12 +254,18 @@ async function _histRefreshActive(){
   _histActive.at = Date.now();
   try {
     const nowIso = new Date().toISOString();
+    // ONLY log karts in a session that is actually RUNNING (green-flagged → status in_progress).
+    // The old version also matched any session whose SCHEDULED time window covered "now", which
+    // logged sessions that were never started. RaceFacer reports status:"in_progress" for a live
+    // race, so we gate strictly on that.
     const { data: sess } = await supa.from('rf_sessions')
       .select('uuid,label,status,track,scheduled_at,ends_at')
-      .or(`status.eq.in_progress,and(scheduled_at.lte.${nowIso},ends_at.gte.${nowIso})`)
+      .eq('status', 'in_progress')
       .limit(12);
     const uuids = (sess || []).map(s => s.uuid);
     if (!uuids.length){ _histActive.karts = []; return []; }
+    if (!_histSessLogged || _histSessLogged !== uuids.join(',')){ _histSessLogged = uuids.join(',');
+      console.log(`[hist] ${uuids.length} session(s) IN PROGRESS → logging: ${(sess || []).map(s => s.label + ' [' + (s.track || '?') + ']').join(', ')}`); }
     const trackByUuid = {}; (sess || []).forEach(s => { trackByUuid[s.uuid] = s.track || ''; });
     const { data: runs } = await supa.from('rf_session_runs')
       .select('kart_no,fleet_management_id,session_uuid')
