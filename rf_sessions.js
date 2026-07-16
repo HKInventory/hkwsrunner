@@ -38,6 +38,8 @@ let _sessHash = {};            // uuid -> content hash of last write
 let _doneFinished = {};        // uuid -> true once a FINISHED session has been stored (never refetch)
 let _lastPrune = 0;
 let _schedLogged = false, _failLogged = 0;
+let _trackCounts = {}, _trackCountSig = '';   // diagnostic: sessions returned per sub-track
+let _trackSeenSig = '';                        // diagnostic: distinct track_configuration values written
 
 function todayStr(){
   // RaceFacer runs on venue-local dates; Sydney.
@@ -87,6 +89,7 @@ async function fetchSchedule(rfJson, date){
         if (!j) continue;
         const out = [];
         collectSessions(j, out, 0);
+        _trackCounts[st == null ? 'all' : st] = out.length;   // diagnostic: sessions returned per sub-track
         if (out.length){
           anyHit = true;
           if (!_schedLogged){ _schedLogged = true; console.log(`[sessions] schedule top-level keys: ${Object.keys(j).slice(0, 12).join(',')}`); }
@@ -96,6 +99,11 @@ async function fetchSchedule(rfJson, date){
     }
     if (anyHit){
       if (!_schedPath){ _schedPath = tmpl; console.log(`[sessions] schedule endpoint locked: ${tmpl} (${combined.length} sessions across ${tracks.length} track(s))`); }
+      // Log the per-sub-track breakdown whenever it changes — this reveals if e.g. only sub_track 4
+      // ever returns sessions (endpoint ignores sub_track_id → Adult never arrives) vs. each track
+      // returning its own. Throttled to changes so it isn't spammy.
+      const sig = JSON.stringify(_trackCounts);
+      if (sig !== _trackCountSig){ _trackCountSig = sig; console.log(`[sessions] per-sub-track counts: ${sig}`); }
       return combined;
     }
   }
@@ -242,6 +250,16 @@ async function syncSessions(rfJson){
     wrote++;
   }
   if (wrote) console.log(`[sessions] ${wrote} session(s) written (${list.length} on today's schedule)`);
+  // Diagnostic: which track_configuration values are actually present in what we fetched today.
+  // If this only ever shows Intermediate, Adult sessions aren't coming back from RaceFacer at all
+  // (schedule/detail endpoint or sub_track_id issue), not an app-display problem.
+  try {
+    const { data: today } = await supa.from('rf_sessions')
+      .select('track').gte('scheduled_at', new Date(Date.now() - 18 * 3600000).toISOString());
+    const tracks = Array.from(new Set((today || []).map(r => (r.track || '?').trim()).filter(Boolean))).sort();
+    const sig = tracks.join('|');
+    if (sig && sig !== _trackSeenSig){ _trackSeenSig = sig; console.log(`[sessions] distinct tracks stored (last 18h): ${tracks.join(', ')}`); }
+  } catch (e) { /* diagnostic only */ }
   await pruneOld();
 }
 
