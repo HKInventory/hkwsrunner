@@ -129,7 +129,10 @@ async function fetchGrid(url){
 }
 
 let _running = false, _idBySerial = {}, _focusRunning = false, _bmsLogged = false;
-let _byKartNo = {};                                  // kart_no -> {id, serial, online} (prefers online row)
+let _byKartNo = {};                                  // kart_no -> {id, serial, online, track} (prefers online row)
+let _byKartTrack = {};                                // "num|track" -> {id, serial, online, track} — exact when numbers duplicate
+// Normalise RaceFacer/RiMO track names to a common token so "Intermediate Track" == "intermediate".
+function _normTrack(t){ t = String(t || '').toLowerCase(); if (/inter/.test(t)) return 'inter'; if (/adult/.test(t)) return 'adult'; if (/junior/.test(t)) return 'junior'; if (/mini/.test(t)) return 'mini'; if (/twin/.test(t)) return 'twin'; if (/melb/.test(t)) return 'melb'; if (/cadet/.test(t)) return 'cadet'; return t.replace(/[^a-z0-9]/g, ''); }
 let _histRunning = false, _histSig = {}, _histActive = { at: 0, karts: [] }, _histLinkLogged = false;
 // kartdata.php returns XML like <data><tag><![CDATA[value]]></tag>…</data>. Pull every leaf field.
 function parseKartData(xml){
@@ -210,7 +213,10 @@ async function syncRimo(){
     // Map every kart's serial -> internal id so the focus sweep can pull its per-kart feeds on demand.
     // Also kart_no -> {id, serial} (prefer the ONLINE row when numbers duplicate) for the history logger.
     rows.forEach(r => { if (r._rimoId) _idBySerial[r.serial_no] = r._rimoId; });
-    rows.forEach(r => { if (!r._rimoId) return; const cur = _byKartNo[r.kart_no]; if (!cur || r.online) _byKartNo[r.kart_no] = { id: r._rimoId, serial: r.serial_no, online: !!r.online }; });
+    rows.forEach(r => { if (!r._rimoId) return; const cur = _byKartNo[r.kart_no]; if (!cur || r.online) _byKartNo[r.kart_no] = { id: r._rimoId, serial: r.serial_no, online: !!r.online, track: r.group_name || '' }; });
+    // Also index by number+track so duplicate kart numbers across types (Junior 2 vs Inter 2) resolve
+    // exactly. Key: "<num>|<normalised track>". Prefer the online row on collision.
+    rows.forEach(r => { if (!r._rimoId || r.kart_no == null) return; const key = r.kart_no + '|' + _normTrack(r.group_name); const cur = _byKartTrack[key]; if (!cur || r.online) _byKartTrack[key] = { id: r._rimoId, serial: r.serial_no, online: !!r.online, track: r.group_name || '' }; });
     // Only write karts whose meaningful state changed since the last poll. At a 1s poll that means
     // ~0 writes most seconds and a handful when a kart flips online/off — the whole fleet is still
     // fully readable (unchanged rows keep their last value), we just avoid re-writing 200 rows/sec.
@@ -249,30 +255,32 @@ async function _histRefreshActive(){
   try {
     const nowIso = new Date().toISOString();
     const { data: sess } = await supa.from('rf_sessions')
-      .select('uuid,label,status,scheduled_at,ends_at')
+      .select('uuid,label,status,track,scheduled_at,ends_at')
       .or(`status.eq.in_progress,and(scheduled_at.lte.${nowIso},ends_at.gte.${nowIso})`)
       .limit(12);
     const uuids = (sess || []).map(s => s.uuid);
     if (!uuids.length){ _histActive.karts = []; return []; }
+    const trackByUuid = {}; (sess || []).forEach(s => { trackByUuid[s.uuid] = s.track || ''; });
     const { data: runs } = await supa.from('rf_session_runs')
       .select('kart_no,fleet_management_id,session_uuid')
       .in('session_uuid', uuids).limit(120);
     const seen = {}, out = [];
     for (const r of (runs || [])){
       const kn = parseInt(r.kart_no, 10); if (!Number.isFinite(kn) || seen[kn]) continue;
-      seen[kn] = true; out.push({ kart_no: kn, fm_id: (r.fleet_management_id || '').trim() });
+      seen[kn] = true; out.push({ kart_no: kn, fm_id: (r.fleet_management_id || '').trim(), track: trackByUuid[r.session_uuid] || '' });
     }
     _histActive.karts = out;
   } catch (e) { /* keep last known set */ }
   return _histActive.karts;
 }
 function _histResolve(k){
-  // fleet_management_id first: exact serial, then serial ENDING with it (RiMO serials may carry a
-  // prefix — "000001264" vs "1264"), then kart number.
-  if (k.fm_id){
-    if (_idBySerial[k.fm_id]) return { id: _idBySerial[k.fm_id], serial: k.fm_id, via: 'fm=serial' };
-    const tail = Object.keys(_idBySerial).find(s => s.endsWith(k.fm_id));
-    if (tail) return { id: _idBySerial[tail], serial: tail, via: 'fm-tail' };
+  // fleet_management_id is CONFIRMED not the RiMO serial (fm_id "0578" vs serial "092018291"), so
+  // we link by KART NUMBER — the thing painted on the kart, consistent across RaceFacer and RiMO.
+  // To handle duplicate numbers across types (Junior 2 vs Intermediate 2), match number + TRACK
+  // first (exact), then fall back to number alone (preferring the online row).
+  if (k.track){
+    const exact = _byKartTrack[k.kart_no + '|' + _normTrack(k.track)];
+    if (exact) return { id: exact.id, serial: exact.serial, via: 'num+track' };
   }
   const byNo = _byKartNo[k.kart_no] || _byKartNo[String(k.kart_no)];
   if (byNo) return { id: byNo.id, serial: byNo.serial, via: 'kart_no' };
@@ -299,10 +307,10 @@ async function historySweep(){
     const active = await _histRefreshActive();
     if (!active.length) return;
     const targets = [];
-    for (const k of active){ const t = _histResolve(k); if (t && (!_byKartNo[k.kart_no] || _byKartNo[k.kart_no].online !== false)) targets.push({ ...t, kart_no: k.kart_no, fm_id: k.fm_id }); }
+    for (const k of active){ const t = _histResolve(k); if (t && (!_byKartNo[k.kart_no] || _byKartNo[k.kart_no].online !== false)) targets.push({ ...t, kart_no: k.kart_no, track: k.track }); }
     if (!targets.length) return;
     if (!_histLinkLogged){ _histLinkLogged = true;
-      const s = targets.slice(0, 4).map(t => `kart ${t.kart_no}: fm_id="${t.fm_id}" -> serial="${t.serial}" (${t.via})`).join('  ·  ');
+      const s = targets.slice(0, 5).map(t => `kart ${t.kart_no} (${t.track || 'no-track'}) -> serial="${t.serial}" via ${t.via}`).join('  ·  ');
       console.log(`[hist] link check: ${s}`); }
     // Fetch BMS for every target with bounded concurrency (be polite to RiMO's server).
     const CONC = Math.max(2, Math.min(10, parseInt(process.env.RIMO_HIST_CONC || '6', 10)));
