@@ -28,7 +28,7 @@ const SB_URL = process.env.SUPABASE_URL || process.env.SB_URL;
 const SB_KEY = process.env.SUPABASE_SERVICE_KEY || process.env.SB_SERVICE_KEY;
 const supa = (SB_URL && SB_KEY) ? createClient(SB_URL, SB_KEY, { auth: { persistSession: false } }) : null;
 const SITE = (process.env.SITE || 'sydney').trim().toLowerCase();
-const SUB_TRACKS = String(process.env.RF_SUB_TRACKS || '4').split(',').map(s => parseInt(s.trim(), 10)).filter(Number.isFinite);
+const SUB_TRACKS = String(process.env.RF_SUB_TRACKS || '1,2,3,4,5,6').split(',').map(s => parseInt(s.trim(), 10)).filter(Number.isFinite);
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const sha = s => crypto.createHash('sha1').update(String(s)).digest('base64').slice(0, 20);
@@ -74,7 +74,13 @@ async function fetchSchedule(rfJson, date){
     '/ajax/sessions-schedule?date={d}',
   ];
   for (const tmpl of candidates){
-    for (const st of SUB_TRACKS){
+    // Poll EVERY sub-track and COMBINE — different tracks (Adult, Intermediate, Junior…) have
+    // different sub_track_ids, so returning on the first track's hit misses all the others.
+    // De-dupe by uuid across tracks.
+    const seen = {}, combined = [];
+    let anyHit = false;
+    const tracks = tmpl.includes('{st}') ? SUB_TRACKS : [null];
+    for (const st of tracks){
       const path = tmpl.replace('{d}', date).replace('{st}', String(st));
       try {
         const j = await rfJson(path, 1);
@@ -82,12 +88,15 @@ async function fetchSchedule(rfJson, date){
         const out = [];
         collectSessions(j, out, 0);
         if (out.length){
-          if (!_schedPath){ _schedPath = tmpl; console.log(`[sessions] schedule endpoint locked: ${tmpl} (${out.length} sessions)`); }
+          anyHit = true;
           if (!_schedLogged){ _schedLogged = true; console.log(`[sessions] schedule top-level keys: ${Object.keys(j).slice(0, 12).join(',')}`); }
-          return out;
+          for (const s of out){ const id = s.uuid || s.rf_session_id || JSON.stringify(s).slice(0, 40); if (!seen[id]){ seen[id] = true; combined.push(s); } }
         }
-      } catch (e) { /* try next */ }
-      if (!tmpl.includes('{st}')) break;   // no per-track variant — one try is enough
+      } catch (e) { /* try next track */ }
+    }
+    if (anyHit){
+      if (!_schedPath){ _schedPath = tmpl; console.log(`[sessions] schedule endpoint locked: ${tmpl} (${combined.length} sessions across ${tracks.length} track(s))`); }
+      return combined;
     }
   }
   if (_failLogged++ < 3) console.log(`[sessions] could not find the schedule endpoint for ${date} — paste the sessions-schedule Response and set RF_SESS_SCHEDULE_PATH`);
