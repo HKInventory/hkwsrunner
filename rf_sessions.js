@@ -118,14 +118,25 @@ function parseLapMins(runs){
 }
 
 async function fetchDetail(rfJson, uuid, subTrack){
-  for (const st of (subTrack ? [subTrack] : SUB_TRACKS)){
+  // The schedule endpoint returns every session under every sub_track_id, so a session's "own"
+  // sub_track_id from the schedule can be wrong — and the detail endpoint returns 0 runs when queried
+  // under the wrong track. That produced "0 karts" / missing Adult races. So: try the hinted track
+  // first, then the rest, and return the response that actually has karts (fall back to a label-only
+  // response if none do, so genuinely-empty slots still register).
+  const order = subTrack ? [subTrack].concat(SUB_TRACKS.filter(x => x !== subTrack)) : SUB_TRACKS;
+  let fallback = null;
+  for (const st of order){
     try {
       const j = await rfJson(`/ajax/session-management/session?type=session&uuid=${uuid}&sub_track_id=${st}`, 1);
       const sd = j && (j.session_data || j.session || j.data);
-      if (sd && (sd.uuid || sd.label || sd.runs)) return sd;
+      if (sd && (sd.uuid || sd.label || sd.runs)){
+        const nRuns = ((sd.runs && (sd.runs.data || sd.runs)) || []).length;
+        if (nRuns > 0) return sd;            // real karts — this is the correct track view
+        if (!fallback) fallback = sd;        // remember an empty view in case no track has karts
+      }
     } catch (e) { /* try next sub-track */ }
   }
-  return null;
+  return fallback;
 }
 
 function rowsFromDetail(sd, uuid){
