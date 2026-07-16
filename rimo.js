@@ -258,9 +258,19 @@ async function _histRefreshActive(){
     // The old version also matched any session whose SCHEDULED time window covered "now", which
     // logged sessions that were never started. RaceFacer reports status:"in_progress" for a live
     // race, so we gate strictly on that.
+    // CRITICAL BANDWIDTH GUARD: also require the session to have been scheduled within the last few
+    // hours. RaceFacer's *finished* status string doesn't match our finished-regex and rf_sessions
+    // only re-syncs TODAY's schedule, so a race that was live at end-of-day gets stuck at
+    // in_progress indefinitely (until the 7-day prune). Without this recency filter the logger then
+    // fetches BMS for that stuck session's karts every tick, 24/7 — and charging karts report
+    // online:1, so they don't get skipped. That is a sustained multi-hundred-MB/hr Supabase-write
+    // leak. Only sessions scheduled in the last STALE_H hours can drive logging.
+    const STALE_H = Math.max(1, parseInt(process.env.RIMO_SESS_MAX_AGE_H || '3', 10));
+    const freshCut = new Date(Date.now() - STALE_H * 3600000).toISOString();
     const { data: sess } = await supa.from('rf_sessions')
       .select('uuid,label,status,track,scheduled_at,ends_at')
       .eq('status', 'in_progress')
+      .gte('scheduled_at', freshCut)
       .limit(12);
     const uuids = (sess || []).map(s => s.uuid);
     if (!uuids.length){ _histActive.karts = []; return []; }

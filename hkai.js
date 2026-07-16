@@ -273,7 +273,7 @@ const TOOLS = [
     input_schema: { type: 'object', properties: {
       kart_no: { type: 'string', description: 'Kart number, required' },
     }, required: ['kart_no'] } },
-  { name: 'query_repairs', description: 'Search repair records across ALL history. Filter by mechanic name, kart number, date range, and/or a keyword in the description. Returns matching repairs (capped at 300, newest first) with date, kart, mechanic and description. Use for "how many repairs did X do", "repairs in <month>", cross-kart searches. For one kart\'s full condition use kart_status instead.',
+  { name: 'query_repairs', description: 'Search repair records across ALL history. Filter by mechanic name, kart number, date range, and/or a keyword in the description. Returns the EXACT total match count (complete across all history) plus up to 300 example rows (newest first) with date, kart, mechanic and description — the count is exact even though only 300 lines are listed. Use for "how many repairs did X do", "repairs in <month>", cross-kart searches. For "most in a single day/week/month/year" or per-mechanic breakdowns use repair_stats. For one kart\'s full condition use kart_status instead.',
     input_schema: { type: 'object', properties: {
       mechanic: { type: 'string', description: 'Mechanic name or part of it (case-insensitive), e.g. "Jayden"' },
       kart_no: { type: 'string', description: 'Kart number, e.g. "43"' },
@@ -301,6 +301,12 @@ const TOOLS = [
       from: { type: 'string', description: 'ISO start of window (optional alternative to session_time)' },
       to: { type: 'string', description: 'ISO end of window (optional)' },
     }, required: ['kart_no'] } },
+  { name: 'repair_stats', description: 'AGGREGATE repair counts across ALL history, bucketed by mechanic and by time period, computed server-side over every matching repair (not a 300-row sample). Use THIS — not query_repairs — for any "who did the MOST repairs in a single day / week / month / year", "busiest day/week", "record holder", or per-mechanic breakdown question. Returns the record holder for each period (day/week/month/year) plus every mechanic\'s total and their personal-best day/week/month/year. Optional mechanic filter and date range.',
+    input_schema: { type: 'object', properties: {
+      mechanic: { type: 'string', description: 'Limit to one mechanic (name or part of it), optional' },
+      from: { type: 'string', description: 'Start date inclusive YYYY-MM-DD, optional' },
+      to: { type: 'string', description: 'End date inclusive YYYY-MM-DD, optional' },
+    } } },
 ];
 
 async function pageAll(table, apply, cap){
@@ -409,6 +415,59 @@ async function runTool(name, args, site){
     const list = filtered.slice(0, 300).map(r => `${r.date_repaired || r.date_discovered || '?'} · Kart ${r.kart_name} · ${r.mechanic || '?'}: ${String(r.description || '').slice(0, 140)}`);
     return `${filtered.length} repair(s) match${filtered.length > 300 ? ' (showing first 300)' : ''}:\n` + list.join('\n');
   }
+  if (name === 'repair_stats'){
+    // Aggregate the WHOLE repair history server-side so the model can answer "most repairs in a
+    // single day/week/month/year" and per-mechanic breakdowns accurately (query_repairs only
+    // shows a 300-row sample). Fetch just date + mechanic (compact) across all matching rows.
+    const rows = await pageAll('rf_repairs', b => {
+      let bb = b.select('date_repaired,date_discovered,mechanic');
+      if (args.mechanic) bb = bb.ilike('mechanic', `%${args.mechanic}%`);
+      if (args.from) bb = bb.or(`date_repaired.gte.${args.from},date_discovered.gte.${args.from}`);
+      if (args.to) bb = bb.or(`date_repaired.lte.${args.to},date_discovered.lte.${args.to}`);
+      return bb.order('id', { ascending: false });
+    }, 60000);
+    const isoWeek = (dateStr) => {
+      const d = new Date(dateStr + 'T00:00:00Z');
+      const dayNum = (d.getUTCDay() + 6) % 7;                 // Mon=0..Sun=6
+      d.setUTCDate(d.getUTCDate() - dayNum + 3);              // Thursday of this week
+      const ft = new Date(Date.UTC(d.getUTCFullYear(), 0, 4));
+      ft.setUTCDate(ft.getUTCDate() - ((ft.getUTCDay() + 6) % 7) + 3);
+      const week = 1 + Math.round((d - ft) / (7 * 86400000));
+      return `${d.getUTCFullYear()}-W${String(week).padStart(2, '0')}`;
+    };
+    const M = {};   // mechanic -> { total, day{}, week{}, month{}, year{} }
+    let counted = 0;
+    for (const r of rows){
+      const date = String(r.date_repaired || r.date_discovered || '').slice(0, 10);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
+      if (args.from && date < args.from) continue;
+      if (args.to && date > args.to) continue;
+      const mech = (String(r.mechanic || '').trim()) || 'Unknown';
+      const m = M[mech] || (M[mech] = { total: 0, day: {}, week: {}, month: {}, year: {} });
+      m.total++; counted++;
+      m.day[date] = (m.day[date] || 0) + 1;
+      const wk = isoWeek(date); m.week[wk] = (m.week[wk] || 0) + 1;
+      const mo = date.slice(0, 7); m.month[mo] = (m.month[mo] || 0) + 1;
+      const yr = date.slice(0, 4); m.year[yr] = (m.year[yr] || 0) + 1;
+    }
+    if (!counted) return 'No dated repairs matched.';
+    const bestOf = (obj) => { let k = null, v = 0; for (const kk in obj) if (obj[kk] > v){ v = obj[kk]; k = kk; } return k ? { k, v } : null; };
+    const globalBest = (period) => { let who = null, bucket = null, cnt = 0; for (const mech in M){ const b = bestOf(M[mech][period]); if (b && b.v > cnt){ cnt = b.v; who = mech; bucket = b.k; } } return who ? { who, bucket, cnt } : null; };
+    const line = (label, g) => `  ${label}: ${g ? `${g.who} — ${g.cnt} (${g.bucket})` : 'no data'}`;
+    let out = `Repair stats over ${counted} dated repair(s)${args.mechanic ? ` for "${args.mechanic}"` : ''}${(args.from || args.to) ? ` [${args.from || '…'} → ${args.to || '…'}]` : ''}.\n`;
+    out += `\nRecord holders — most repairs in a single…\n`;
+    out += line('Day', globalBest('day')) + '\n';
+    out += line('Week (ISO Mon–Sun)', globalBest('week')) + '\n';
+    out += line('Month', globalBest('month')) + '\n';
+    out += line('Year', globalBest('year')) + '\n';
+    const mechs = Object.keys(M).sort((a, b) => M[b].total - M[a].total);
+    out += `\nPer mechanic (total · best day · best week · best month · best year):\n`;
+    for (const mech of mechs.slice(0, 14)){
+      const m = M[mech], bd = bestOf(m.day), bw = bestOf(m.week), bm = bestOf(m.month), by = bestOf(m.year);
+      out += `  ${mech}: ${m.total} · ${bd ? bd.v + ' (' + bd.k + ')' : '-'} · ${bw ? bw.v + ' (' + bw.k + ')' : '-'} · ${bm ? bm.v + ' (' + bm.k + ')' : '-'} · ${by ? by.v + ' (' + by.k + ')' : '-'}\n`;
+    }
+    return out;
+  }
   if (name === 'search_notes'){
     const rows = await pageAll('rf_kart_notes', b => {
       let bb = b.select('rf_kart_id,note,created_by,created_at,active');
@@ -505,13 +564,15 @@ You have an always-on snapshot below (fleet + ALL open kart notes regardless of 
 - parts used in a kart's repairs → repair_parts
 - staff roster → staff_roster
 - all-time repair leaderboard → repair_leaderboard
+- repair COUNTS, records, busiest day/week/month/year, or per-mechanic breakdowns → repair_stats
 Never answer "I don't have that data" without first trying the relevant tool. The tools cover ALL history.
 
 RULES:
 - Never invent karts, repairs, people, sessions or readings. If a tool returns nothing, say so plainly.
 - When the question is about ONE specific kart's condition/state/issue/status ("what's wrong with kart N", "is kart N ok", "does kart N have a X problem"), you MUST call kart_status for that kart. Do not answer a single-kart condition question from the snapshot or from repairs alone.
 - The NEWEST note is the current word on a kart. Lead with it. If the newest note says the kart was taken out of rotation / still faulty / not fixed, say that is the current status — even if an earlier repair said "tested fine". A later note about the same fault OVERRIDES an earlier "fixed" repair. Never conclude a kart is "running okay" if a more recent note contradicts it.
-- For "how many" questions, use the tool (query_repairs with count_only, or search_notes) rather than eyeballing — then state the number, then list.
+- For "how many" questions, use the tool (query_repairs with count_only, or search_notes) rather than eyeballing — then state the number, then list. query_repairs returns the EXACT total across all history (the count is complete even though only 300 example lines are shown), so never say a count is approximate or "capped" — the number is exact.
+- For "who did the MOST in a single day / week / month / year", "busiest day", "record holder", or any per-mechanic time breakdown, call repair_stats (ONE call answers it precisely over the whole history). Do NOT try to reconstruct this by paging query_repairs date-by-date, and never give a "~approx" answer or an "I can't without iterating" caveat — repair_stats gives the exact figures.
 - A kart is "out of action" if DAMAGED or LONG-TERM; treat both as out of action unless asked otherwise. A kart with no note is still out of action if its status says so — never imply it's fine.
 - For battery/cell questions, bms_session_summary gives the diagnosis (worst-sagging cell etc.). For a full 0.5s trace of every cell, tell the user to open the Session Data screen — don't try to list thousands of readings.
 - Be concise and direct — a busy mechanic is reading on a phone. Use Sydney time. Cells are L1–L8 (left) / R1–R8 (right); healthy ~3.2–3.6V, a dead cell sags well below the others under load. You are read-only.

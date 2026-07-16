@@ -176,6 +176,18 @@ function rowsFromDetail(sd, uuid){
 async function pruneOld(){
   if (Date.now() - _lastPrune < 6 * 3600000) return;
   _lastPrune = Date.now();
+  // Self-heal stuck sessions: any row still marked in_progress but scheduled well in the past never
+  // got a finished-status update (RaceFacer's finished string doesn't match /finish|complete|closed|
+  // ended/ and we only re-sync today's schedule). Left alone they make the RiMO BMS logger think a
+  // race is live and log its karts 24/7. Flip them so nothing treats them as running. Cheap: only
+  // matches the handful of genuinely-stuck rows.
+  try {
+    const staleCut = new Date(Date.now() - 3 * 3600000).toISOString();
+    const { data: healed } = await supa.from('rf_sessions')
+      .update({ status: 'ended', updated_at: new Date().toISOString() })
+      .eq('status', 'in_progress').lt('scheduled_at', staleCut).select('uuid');
+    if (healed && healed.length) console.log(`[sessions] self-healed ${healed.length} stuck in_progress session(s) → ended`);
+  } catch (e) { /* non-fatal */ }
   const cutoff = new Date(Date.now() - 7 * 86400000).toISOString();
   try {
     const { data: old } = await supa.from('rf_sessions').select('uuid').lt('scheduled_at', cutoff).limit(500);
@@ -202,14 +214,22 @@ async function syncSessions(rfJson){
     const st = (s.status || '').toLowerCase();
     if (st.includes('progress')) return true;
     return true;                          // not-yet-final: sync it (cheap; write-on-change)
-  }).slice(0, 15);
+  }).slice(0, 25);
   let wrote = 0;
   for (const s of wanted){
     const sd = await fetchDetail(rfJson, s.uuid, s.sub_track_id);
     if (!sd) continue;
     const { sess, runRows } = rowsFromDetail(sd, s.uuid);
     const h = sha(JSON.stringify(sess) + JSON.stringify(runRows));
-    const finished = /finish|complete|closed|ended/i.test(sess.status);
+    // "Finished" = RaceFacer says so OR the scheduled end time has passed and it's no longer live.
+    // The status-word check alone misses RaceFacer's real finished string, so past races never got
+    // marked done — they kept occupying the per-cycle fetch window and starved later sessions (some
+    // finished/chequered races then never landed). The time fallback fixes that. We deliberately do
+    // NOT mark a session done while it's still in_progress past its end time (a race that ran long)
+    // so we keep syncing until its status actually clears.
+    const stLc = (sess.status || '').toLowerCase();
+    const endPassed = sess.ends_at && Date.parse(sess.ends_at) < (Date.now() - 5 * 60000);
+    const finished = /finish|complete|closed|ended|done/i.test(stLc) || (endPassed && !stLc.includes('progress'));
     if (_sessHash[s.uuid] === h){ if (finished) _doneFinished[s.uuid] = true; continue; }
     _sessHash[s.uuid] = h;
     const { error: e1 } = await supa.from('rf_sessions').upsert(sess, { onConflict: 'uuid' });
