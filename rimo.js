@@ -129,6 +129,8 @@ async function fetchGrid(url){
 }
 
 let _running = false, _idBySerial = {}, _focusRunning = false, _bmsLogged = false;
+let _byKartNo = {};                                  // kart_no -> {id, serial, online} (prefers online row)
+let _histRunning = false, _histSig = {}, _histActive = { at: 0, karts: [] }, _histLinkLogged = false;
 // kartdata.php returns XML like <data><tag><![CDATA[value]]></tag>…</data>. Pull every leaf field.
 function parseKartData(xml){
   const inner = (String(xml).match(/<data>([\s\S]*)<\/data>/i) || [null, String(xml)])[1];
@@ -206,7 +208,9 @@ async function syncRimo(){
     const rows = parseRimoRows(res.body);
     if (!rows.length) { console.log(`[rimo] 0 rows parsed (status ${res.status}, ${String(res.body).length} bytes) ${String(res.body).slice(0, 120).replace(/\s+/g, ' ')}`); return; }
     // Map every kart's serial -> internal id so the focus sweep can pull its per-kart feeds on demand.
+    // Also kart_no -> {id, serial} (prefer the ONLINE row when numbers duplicate) for the history logger.
     rows.forEach(r => { if (r._rimoId) _idBySerial[r.serial_no] = r._rimoId; });
+    rows.forEach(r => { if (!r._rimoId) return; const cur = _byKartNo[r.kart_no]; if (!cur || r.online) _byKartNo[r.kart_no] = { id: r._rimoId, serial: r.serial_no, online: !!r.online }; });
     // Only write karts whose meaningful state changed since the last poll. At a 1s poll that means
     // ~0 writes most seconds and a handful when a kart flips online/off — the whole fleet is still
     // fully readable (unchanged rows keep their last value), we just avoid re-writing 200 rows/sec.
@@ -228,6 +232,100 @@ async function syncRimo(){
   finally { _running = false; }
 }
 
+/* ── BMS CELL HISTORY (for HK AI: "which cell died during the 10:00 session?") ─────────────
+   Logs per-cell voltages at RiMO tick (RIMO_HIST_MS, default 1000ms) for karts that are IN A
+   SESSION right now (rf_sessions in_progress / inside its time window, synced by rf_sessions.js).
+   Fetches from RiMO are inbound = free on Render; Supabase WRITES only happen when a kart's cell
+   values actually changed (the same change-detection as the grid), batched one insert per tick.
+   Kill switch: RIMO_HISTORY=off. Retention: rf_sessions.js prunes rows older than 7 days.
+
+   Kart linking: primary = fleet_management_id (from the session) matched against the RiMO serial;
+   fallback = kart number. A one-time "[hist] link check" log prints both side-by-side so we can
+   confirm whether fleet_management_id really is the RiMO serial. */
+async function _histRefreshActive(){
+  // Which karts are on track right now? Cached 15s — one cheap read, not one per tick.
+  if (Date.now() - _histActive.at < 15000) return _histActive.karts;
+  _histActive.at = Date.now();
+  try {
+    const nowIso = new Date().toISOString();
+    const { data: sess } = await supa.from('rf_sessions')
+      .select('uuid,label,status,scheduled_at,ends_at')
+      .or(`status.eq.in_progress,and(scheduled_at.lte.${nowIso},ends_at.gte.${nowIso})`)
+      .limit(12);
+    const uuids = (sess || []).map(s => s.uuid);
+    if (!uuids.length){ _histActive.karts = []; return []; }
+    const { data: runs } = await supa.from('rf_session_runs')
+      .select('kart_no,fleet_management_id,session_uuid')
+      .in('session_uuid', uuids).limit(120);
+    const seen = {}, out = [];
+    for (const r of (runs || [])){
+      const kn = parseInt(r.kart_no, 10); if (!Number.isFinite(kn) || seen[kn]) continue;
+      seen[kn] = true; out.push({ kart_no: kn, fm_id: (r.fleet_management_id || '').trim() });
+    }
+    _histActive.karts = out;
+  } catch (e) { /* keep last known set */ }
+  return _histActive.karts;
+}
+function _histResolve(k){
+  // fleet_management_id first: exact serial, then serial ENDING with it (RiMO serials may carry a
+  // prefix — "000001264" vs "1264"), then kart number.
+  if (k.fm_id){
+    if (_idBySerial[k.fm_id]) return { id: _idBySerial[k.fm_id], serial: k.fm_id, via: 'fm=serial' };
+    const tail = Object.keys(_idBySerial).find(s => s.endsWith(k.fm_id));
+    if (tail) return { id: _idBySerial[tail], serial: tail, via: 'fm-tail' };
+  }
+  const byNo = _byKartNo[k.kart_no] || _byKartNo[String(k.kart_no)];
+  if (byNo) return { id: byNo.id, serial: byNo.serial, via: 'kart_no' };
+  return null;
+}
+function _histRowOf(bms, serial, kartNo){
+  const num = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : null; };
+  const cells = [];
+  for (const side of ['Left', 'Right']) for (let i = 1; i <= 8; i++) cells.push(num(bms[`cell${i}Voltage${side}`]));
+  const faults = {};
+  ['overCurrent','systemFault','chassisConnectionFault','errorCOM','errorRelais'].forEach(f => { if (num(bms[f])) faults[f] = num(bms[f]); });
+  ['cellFault','tempExtFault','tempIntFault','underVoltage','overVoltage','overTempFault'].forEach(f => ['Left','Right'].forEach(s => { if (num(bms[f + s])) faults[f + s] = num(bms[f + s]); }));
+  return {
+    serial_no: serial, kart_no: kartNo, at: new Date().toISOString(),
+    soc: num(bms.socLeft), pack_v: num(bms.voltageLeft), avg_v: num(bms.voltageRight),
+    current_a: num(bms.actualCurrent), cells,
+    faults: Object.keys(faults).length ? faults : null,
+  };
+}
+async function historySweep(){
+  if (!supa || _histRunning || !loggedIn || process.env.RIMO_HISTORY === 'off') return;
+  _histRunning = true;
+  try {
+    const active = await _histRefreshActive();
+    if (!active.length) return;
+    const targets = [];
+    for (const k of active){ const t = _histResolve(k); if (t && (!_byKartNo[k.kart_no] || _byKartNo[k.kart_no].online !== false)) targets.push({ ...t, kart_no: k.kart_no, fm_id: k.fm_id }); }
+    if (!targets.length) return;
+    if (!_histLinkLogged){ _histLinkLogged = true;
+      const s = targets.slice(0, 4).map(t => `kart ${t.kart_no}: fm_id="${t.fm_id}" -> serial="${t.serial}" (${t.via})`).join('  ·  ');
+      console.log(`[hist] link check: ${s}`); }
+    // Fetch BMS for every target with bounded concurrency (be polite to RiMO's server).
+    const CONC = Math.max(2, Math.min(10, parseInt(process.env.RIMO_HIST_CONC || '6', 10)));
+    const rows = [];
+    for (let i = 0; i < targets.length; i += CONC){
+      const batch = targets.slice(i, i + CONC);
+      const got = await Promise.all(batch.map(t => fetchKartBms(t.id).then(b => ({ t, b })).catch(() => ({ t, b: null }))));
+      for (const { t, b } of got){
+        if (!b) continue;
+        const row = _histRowOf(b, t.serial, t.kart_no);
+        const sig = JSON.stringify([row.cells, row.soc, row.current_a, row.pack_v]);
+        if (_histSig[t.serial] === sig) continue;   // no cell/soc/current movement -> no write
+        _histSig[t.serial] = sig;
+        rows.push(row);
+      }
+    }
+    if (!rows.length) return;
+    const { error } = await supa.from('rimo_bms_history').insert(rows);
+    if (error){ if (!/relation|does not exist/i.test(error.message)) console.error('[hist] insert:', error.message); }
+  } catch (e) { console.error('[hist]', e.message || e); }
+  finally { _histRunning = false; }
+}
+
 function startRimo(){
   if (!USER || !PASS) { console.log('[rimo] RIMO_USER/RIMO_PASS not set — RiMO poller disabled'); return; }
   syncRimo();
@@ -235,7 +333,11 @@ function startRimo(){
   const detailOn = process.env.RIMO_DETAIL !== 'off';
   const FOCUS_MS = Math.max(1000, parseInt(process.env.RIMO_FOCUS_MS || '1500', 10));
   if (detailOn) setTimeout(function run(){ focusSweep().catch(() => {}).finally(() => setTimeout(run, FOCUS_MS)); }, 3000);   // fast per-kart telemetry for the viewed kart
-  console.log(`[rimo] poller started — grid every ${POLL_MS / 1000}s` + (detailOn ? `, focus detail every ${FOCUS_MS}ms (only writes on change)` : ', detail OFF (grid only: online/SOC/BMS)'));
+  // BMS cell-history logger (session karts, RiMO tick, write-on-change). RIMO_HISTORY=off disables.
+  const histOn = process.env.RIMO_HISTORY !== 'off';
+  const HIST_MS = Math.max(500, parseInt(process.env.RIMO_HIST_MS || '1000', 10));
+  if (histOn) setTimeout(function run(){ historySweep().catch(() => {}).finally(() => setTimeout(run, HIST_MS)); }, 6000);
+  console.log(`[rimo] poller started — grid every ${POLL_MS / 1000}s` + (detailOn ? `, focus detail every ${FOCUS_MS}ms (only writes on change)` : ', detail OFF (grid only: online/SOC/BMS)') + (histOn ? `, cell history every ${HIST_MS}ms for session karts` : ', history OFF'));
 }
 
 module.exports = { startRimo, syncRimo, parseRimoRows };
