@@ -90,13 +90,14 @@ async function gatherContext(row){
     }).join('\n'));
   }
 
-  // Open notes on OK/maintenance karts too (so nothing is hidden), briefer
+  // ALL OTHER karts that have open notes — status-blind, so a note on an "OK" kart is never hidden
+  // ("brakes feel soft" on a running kart still surfaces). Every open note in the fleet is visible here.
   const otherNoted = karts.filter(k => !k.long_term && k.status !== 'damaged' && (notesByKart[k.rf_id] || []).length);
   if (otherNoted.length){
-    S.push(`OTHER KARTS WITH OPEN NOTES (${otherNoted.length}, status OK/maintenance):`);
-    S.push(otherNoted.map(k => `Kart ${k.name} [${statusOf(k)}]: ${(notesByKart[k.rf_id] || []).map(n => `"${String(n.note).replace(/\s+/g, ' ').trim()}"`).join('; ')}`).join('\n'));
+    S.push(`OTHER KARTS WITH OPEN NOTES (${otherNoted.length} — these karts are OK/maintenance but HAVE notes; do not ignore):`);
+    S.push(otherNoted.map(k => `Kart ${k.name} [${statusOf(k)}]: ${(notesByKart[k.rf_id] || []).map(n => `"${String(n.note).replace(/\s+/g, ' ').trim()}" (${n.created_by || '?'}, ${syd(n.created_at)})`).join('; ')}`).join('\n'));
   }
-  S.push(`NOTE TOTALS: ${notes.length} open notes across ${Object.keys(notesByKart).length} karts; ${outKarts.length} karts are DAMAGED or LONG-TERM.`);
+  S.push(`NOTE TOTALS: ${notes.length} open notes across ${Object.keys(notesByKart).length} karts; ${outKarts.length} karts are DAMAGED or LONG-TERM. Every OPEN note in the fleet is listed above regardless of kart status. For resolved/older notes on a kart, call kart_status.`);
   const byName = {}; karts.forEach(k => { byName[String(k.name)] = k; });
 
   // Recent repairs (14 days) + full history for any kart the question names
@@ -246,7 +247,33 @@ function bmsAnalysis(rows){
    history (text, cheap). BMS returns a SUMMARY, never thousands of raw rows (the Session Data
    screen is where raw 0.5s traces are browsed). */
 const TOOLS = [
-  { name: 'query_repairs', description: 'Search repair records across ALL history. Filter by mechanic name, kart number, date range, and/or a keyword in the description. Returns matching repairs (capped at 300, newest first) with date, kart, mechanic and description. Use for "how many repairs did X do", "what was repaired on kart N", "repairs in <month>", etc.',
+  { name: 'query_stock', description: 'Search parts/warehouse inventory. Filter by keyword (name/SKU), or low_only to get parts at/below their reorder level. Returns SKU, description, quantity on hand, reorder level, price and location. Use for "how many X do we have", "what\'s low on stock", "do we have brake pads".',
+    input_schema: { type: 'object', properties: {
+      keyword: { type: 'string', description: 'Word in the part name or SKU, e.g. "brake", "tyre", "chain"' },
+      low_only: { type: 'boolean', description: 'Only parts at/below reorder level' },
+    } } },
+  { name: 'query_activity', description: 'Search the stock activity log (parts taken and restocked). Filter by staff member, part keyword/SKU, action (TAKEN or RESTOCK), and date range. Returns who did what, when, and quantity. Use for "who took the last set of tyres", "what did X take this week", "restocks in June".',
+    input_schema: { type: 'object', properties: {
+      staff: { type: 'string', description: 'Staff member name or part of it' },
+      keyword: { type: 'string', description: 'Word in the part SKU/name' },
+      action: { type: 'string', description: '"TAKEN" or "RESTOCK"' },
+      from: { type: 'string', description: 'Start date YYYY-MM-DD' },
+      to: { type: 'string', description: 'End date YYYY-MM-DD' },
+    } } },
+  { name: 'repair_parts', description: 'List the parts used in repairs for a given kart (and/or keyword). Returns each part name, quantity and price against its repair. Use for "what parts went into kart N\'s repairs", "how many X have we fitted".',
+    input_schema: { type: 'object', properties: {
+      kart_no: { type: 'string', description: 'Kart number' },
+      keyword: { type: 'string', description: 'Word in the part name' },
+    } } },
+  { name: 'staff_roster', description: 'The staff roster: names and roles. Use to answer "who works here", "who are the mechanics", or to resolve a first name to a full name.',
+    input_schema: { type: 'object', properties: {} } },
+  { name: 'repair_leaderboard', description: 'All-time repair totals per mechanic (the workshop leaderboard). Returns each mechanic and their total repair count. Use for "who has done the most repairs", "how many repairs has X done all-time".',
+    input_schema: { type: 'object', properties: {} } },
+  { name: 'kart_status', description: 'Get the COMPLETE current picture for ONE kart: its status (OK/For-Maintenance/Damaged/Long-Term), ALL its notes newest-first (open and resolved), and its recent repairs. ALWAYS call this when the user asks about a specific kart\'s condition/state/issue — it is the authoritative source for "what\'s wrong with kart N" and "is kart N ok". The newest note is the current word on the kart.',
+    input_schema: { type: 'object', properties: {
+      kart_no: { type: 'string', description: 'Kart number, required' },
+    }, required: ['kart_no'] } },
+  { name: 'query_repairs', description: 'Search repair records across ALL history. Filter by mechanic name, kart number, date range, and/or a keyword in the description. Returns matching repairs (capped at 300, newest first) with date, kart, mechanic and description. Use for "how many repairs did X do", "repairs in <month>", cross-kart searches. For one kart\'s full condition use kart_status instead.',
     input_schema: { type: 'object', properties: {
       mechanic: { type: 'string', description: 'Mechanic name or part of it (case-insensitive), e.g. "Jayden"' },
       kart_no: { type: 'string', description: 'Kart number, e.g. "43"' },
@@ -288,6 +315,83 @@ async function pageAll(table, apply, cap){
 
 async function runTool(name, args, site){
   args = args || {};
+  if (name === 'query_stock'){
+    const parts = await pageAll('parts', b => b.select('sku,desc,qty,min_stock,reorder,price,cost,category,loc,location'), 6000);
+    let rows = parts;
+    if (args.keyword){ const k = args.keyword.toLowerCase(); rows = rows.filter(p => (String(p.desc || '') + ' ' + String(p.sku || '') + ' ' + String(p.category || '')).toLowerCase().includes(k)); }
+    const reorderOf = p => (p.reorder != null ? p.reorder : (p.min_stock != null ? p.min_stock : 0));
+    if (args.low_only) rows = rows.filter(p => Number(p.qty) <= Number(reorderOf(p)));
+    if (!rows.length) return 'No matching stock.';
+    return `${rows.length} part(s):\n` + rows.slice(0, 200).map(p => `${p.desc || p.sku} (SKU ${p.sku}) — qty ${p.qty}${reorderOf(p) ? ', reorder ' + reorderOf(p) : ''}${(p.price || p.cost) ? ', $' + (p.price || p.cost) : ''}${(p.loc || p.location) ? ', @' + (p.loc || p.location) : ''}`).join('\n');
+  }
+  if (name === 'query_activity'){
+    const logs = await pageAll('logs', b => {
+      let bb = b.select('action,sku,qty,ts,staff_name,title,note,site').eq('site', site);
+      if (args.action) bb = bb.eq('action', String(args.action).toUpperCase());
+      return bb.order('ts', { ascending: false });
+    }, 12000);
+    let rows = logs;
+    if (args.staff){ const s = args.staff.toLowerCase(); rows = rows.filter(l => String(l.staff_name || '').toLowerCase().includes(s)); }
+    if (args.keyword){ const k = args.keyword.toLowerCase(); rows = rows.filter(l => (String(l.sku || '') + ' ' + String(l.title || '')).toLowerCase().includes(k)); }
+    if (args.from) rows = rows.filter(l => (l.ts || '') >= args.from);
+    if (args.to) rows = rows.filter(l => (l.ts || '') <= args.to + 'T23:59:59Z');
+    if (!rows.length) return 'No matching activity.';
+    return `${rows.length} log entr(y/ies):\n` + rows.slice(0, 200).map(l => `${syd(l.ts)} · ${l.action} · ${l.staff_name || '?'} · ${l.sku || l.title || ''}${l.qty ? ' ×' + l.qty : ''}`).join('\n');
+  }
+  if (name === 'repair_parts'){
+    // repairs (filtered by kart) -> their parts
+    let repIds = null;
+    if (args.kart_no){
+      const reps = await q('rf_repairs', b => b.select('id').eq('kart_name', String(args.kart_no)).limit(400));
+      repIds = reps.map(r => r.id);
+      if (!repIds.length) return `No repairs found for kart ${args.kart_no}.`;
+    }
+    const parts = await pageAll('rf_repair_parts', b => {
+      let bb = b.select('repair_id,part_name,qty,price');
+      if (repIds) bb = bb.in('repair_id', repIds.slice(0, 300));
+      return bb;
+    }, 8000);
+    let rows = parts;
+    if (args.keyword){ const k = args.keyword.toLowerCase(); rows = rows.filter(p => String(p.part_name || '').toLowerCase().includes(k)); }
+    if (!rows.length) return 'No matching repair parts.';
+    // tally by part name
+    const tally = {}; rows.forEach(p => { const nm = p.part_name || '?'; tally[nm] = (tally[nm] || 0) + (Number(p.qty) || 1); });
+    const top = Object.keys(tally).sort((a, b) => tally[b] - tally[a]).slice(0, 40);
+    return `${rows.length} part line(s)${args.kart_no ? ' for kart ' + args.kart_no : ''}. Totals by part:\n` + top.map(nm => `${nm}: ${tally[nm]}`).join('\n');
+  }
+  if (name === 'staff_roster'){
+    const staff = await q('staff_public', b => b.select('name,role').order('name').limit(200));
+    if (!staff.length) return 'No staff on record.';
+    return 'STAFF:\n' + staff.map(s => `${s.name}${s.role ? ' — ' + s.role : ''}`).join('\n');
+  }
+  if (name === 'repair_leaderboard'){
+    const tot = await q('repair_totals_public', b => b.select('name,total,last_at').order('total', { ascending: false }).limit(100));
+    if (!tot.length) return 'No leaderboard data.';
+    return 'ALL-TIME REPAIR TOTALS:\n' + tot.map(t => `${t.name}: ${t.total}${t.last_at ? ' (last ' + syd(t.last_at) + ')' : ''}`).join('\n');
+  }
+  if (name === 'kart_status'){
+    if (!args.kart_no) return 'kart_no is required.';
+    const kn = String(args.kart_no);
+    const karts = await q('rf_karts', b => b.select('rf_id,name,type,status,long_term').eq('site', site).eq('name', kn).limit(3));
+    if (!karts.length) return `No kart numbered ${kn} found for this site.`;
+    const k = karts[0];
+    const statusTxt = k.long_term ? 'LONG-TERM (out of active fleet)' : (k.status === 'damaged' ? 'DAMAGED' : (k.status === 'maint' || k.status === 'for_maintenance' ? 'FOR-MAINTENANCE' : 'OK'));
+    // ALL notes for this kart, newest first (open + resolved), across all history
+    const notes = await pageAll('rf_kart_notes', b => b.select('note,created_by,created_at,active').eq('rf_kart_id', k.rf_id).order('created_at', { ascending: false }), 2000);
+    // recent repairs for this kart
+    const reps = await q('rf_repairs', b => b.select('date_discovered,date_repaired,mechanic,description').eq('kart_name', kn).order('id', { ascending: false }).limit(40));
+    let out = `KART ${kn} [${k.type || ''}] — STATUS: ${statusTxt}.\n`;
+    if (notes.length){
+      const open = notes.filter(n => n.active), closed = notes.filter(n => !n.active);
+      out += `\nNEWEST NOTE (current word on this kart): "${String(notes[0].note).replace(/\s+/g, ' ').trim()}" — ${notes[0].created_by || '?'}, ${syd(notes[0].created_at)}${notes[0].active ? '' : ' [resolved]'}\n`;
+      if (open.length){ out += `\nALL OPEN NOTES (${open.length}, newest first):\n` + open.map(n => `• ${syd(n.created_at)} — ${n.created_by || '?'}: "${String(n.note).replace(/\s+/g, ' ').trim()}"`).join('\n') + '\n'; }
+      if (closed.length){ out += `\nRESOLVED NOTES (${closed.length}, newest first):\n` + closed.slice(0, 15).map(n => `• ${syd(n.created_at)} — ${n.created_by || '?'}: "${String(n.note).replace(/\s+/g, ' ').trim()}"`).join('\n') + '\n'; }
+    } else { out += '\nNo notes on record for this kart.\n'; }
+    if (reps.length){
+      out += `\nRECENT REPAIRS (newest first):\n` + reps.slice(0, 20).map(r => `• ${r.date_repaired || r.date_discovered || '?'} — ${r.mechanic || '?'}: ${String(r.description || '').slice(0, 150)}`).join('\n');
+    } else { out += '\nNo repairs on record for this kart.'; }
+    return out;
+  }
   if (name === 'query_repairs'){
     const rows = await pageAll('rf_repairs', b => {
       let bb = b.select('kart_name,date_discovered,date_repaired,mechanic,description');
@@ -390,10 +494,23 @@ async function processRow(row){
 
     const system = `You are HK AI, the Hyper Karting Sydney workshop assistant, answering questions for staff inside the HK Workshop app. You answer from live workshop data (RaceFacer, RiMO, the app's own tables).
 
-You have an always-on snapshot below (fleet + out-of-action karts + live RiMO). For ANYTHING it doesn't cover — repairs by a person, repairs in a date range, full repair/note history, older sessions, or battery cell data — CALL A TOOL to fetch it. Do not answer "I only have recent data": use query_repairs / search_notes / list_sessions / bms_session_summary to get exactly what's needed. The tools cover ALL history.
+You have an always-on snapshot below (fleet + ALL open kart notes regardless of status + out-of-action karts + live RiMO + low stock). For ANYTHING it doesn't cover, CALL A TOOL — you can reach essentially everything in the workshop's data:
+- repairs (any person/kart/date/keyword, all history) → query_repairs
+- one kart's full condition (status + all notes + repairs) → kart_status
+- kart notes search (open or resolved, any keyword) → search_notes
+- sessions and who was in them → list_sessions
+- battery/cell health for a kart in a session → bms_session_summary
+- parts & warehouse stock levels → query_stock
+- stock activity log, who took/restocked what → query_activity
+- parts used in a kart's repairs → repair_parts
+- staff roster → staff_roster
+- all-time repair leaderboard → repair_leaderboard
+Never answer "I don't have that data" without first trying the relevant tool. The tools cover ALL history.
 
 RULES:
 - Never invent karts, repairs, people, sessions or readings. If a tool returns nothing, say so plainly.
+- When the question is about ONE specific kart's condition/state/issue/status ("what's wrong with kart N", "is kart N ok", "does kart N have a X problem"), you MUST call kart_status for that kart. Do not answer a single-kart condition question from the snapshot or from repairs alone.
+- The NEWEST note is the current word on a kart. Lead with it. If the newest note says the kart was taken out of rotation / still faulty / not fixed, say that is the current status — even if an earlier repair said "tested fine". A later note about the same fault OVERRIDES an earlier "fixed" repair. Never conclude a kart is "running okay" if a more recent note contradicts it.
 - For "how many" questions, use the tool (query_repairs with count_only, or search_notes) rather than eyeballing — then state the number, then list.
 - A kart is "out of action" if DAMAGED or LONG-TERM; treat both as out of action unless asked otherwise. A kart with no note is still out of action if its status says so — never imply it's fine.
 - For battery/cell questions, bms_session_summary gives the diagnosis (worst-sagging cell etc.). For a full 0.5s trace of every cell, tell the user to open the Session Data screen — don't try to list thousands of readings.
@@ -403,7 +520,7 @@ ALWAYS-ON SNAPSHOT:
 ${context}`;
 
     let tin = 0, tout = 0, answer = '', guard = 0;
-    while (guard++ < 6){
+    while (guard++ < 8){
       const r = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01' },
