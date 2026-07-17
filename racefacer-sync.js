@@ -772,10 +772,16 @@ function _kniParse(j, add){
     if (it && typeof it === 'object' && !Array.isArray(it)){
       const id = it.id != null ? it.id : (it.kart_note_id != null ? it.kart_note_id : it.note_id);
       const kart = it.kart_id != null ? it.kart_id : (it.kart_garage_id != null ? it.kart_garage_id : it.rf_kart_id);
-      const note = it.note != null ? it.note : (it.message != null ? it.message : (it.annotation != null ? it.annotation : it.description));
+      let note = it.note != null ? it.note : (it.message != null ? it.message : (it.annotation != null ? it.annotation : it.description));
+      // object rows can also carry an HTML action column that holds the button ids/kart/text
+      const htmlBlob = [it.action, it.actions, it.options, it.buttons, it.tools].filter(Boolean).join(' ');
+      if (htmlBlob){ for (const b of parseKartNoteButtons(htmlBlob)) if (add(b.kartNoteId, kart != null ? kart : b.rfKartId, note != null ? note : b.note)) any = true; }
       if (id != null && add(id, kart, note)) any = true;
     } else if (Array.isArray(it)){
-      for (const b of parseKartNoteButtons(it.join(' '))) if (b.kartNoteId != null && add(b.kartNoteId, b.rfKartId, b.note)) any = true;
+      const joined = it.map((c) => (c == null ? '' : String(c))).join(' ');
+      let textCell = '';   // longest non-numeric plain-text cell -> note fallback when the button lacks data-message
+      for (const c of it){ const t = String(c == null ? '' : c).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim(); if (t.length > textCell.length && !/^\d+$/.test(t) && !/^\d{2}\.\d{2}\.\d{4}/.test(t)) textCell = t; }
+      for (const b of parseKartNoteButtons(joined)) if (add(b.kartNoteId, b.rfKartId, b.note || textCell)) any = true;
     }
   }
   return any;
@@ -799,9 +805,11 @@ async function getKartNoteIndex({ probe = true } = {}){
 
   const out = [], seen = new Set();
   const add = (id, kart, note) => { const n = Number(id); if (!n || seen.has(n)) return false; seen.add(n); out.push({ kartNoteId: n, rfKartId: (kart != null && /^\d+$/.test(String(kart))) ? Number(kart) : null, note: note != null ? String(note) : null }); return true; };
-  let cands = ['/ajax/garage/notes_list/?page=1&results=1000&search=', '/ajax/garage/kart-notes_list/?page=1&results=1000&search=', '/ajax/garage/kart_notes_list/?page=1&results=1000&search=', '/ajax/garage/notes/list?page=1&results=1000'];
+  let cands = ['/ajax/garage/kart-notes-table', '/ajax/garage/kart-notes-table?page=1&results=1000&search=', '/ajax/garage/notes_list/?page=1&results=1000&search=', '/ajax/garage/kart-notes_list/?page=1&results=1000&search=', '/ajax/garage/kart_notes_list/?page=1&results=1000&search='];
+  let _pageHtml = '';
   try {
     const html = await (await rf('/en/administration/garage/kart-notes')).text();
+    _pageHtml = html;
     for (const b of parseKartNoteButtons(html)) if (b.kartNoteId != null) add(b.kartNoteId, b.rfKartId, b.note);   // client-rendered case
     const disc = []; let m;
     const re1 = /ajax\s*:\s*(?:\{[^}]*?url\s*:\s*)?["']([^"']+)["']/gi; while ((m = re1.exec(html))) disc.push(m[1]);
@@ -811,12 +819,15 @@ async function getKartNoteIndex({ probe = true } = {}){
   } catch (e) {}
   if (out.length){ _kniUrl = ''; _kni = { at: Date.now(), data: out }; return out; }   // page was client-rendered -> use its buttons; no ajax url to memo
 
+  let _probeSample = '';
   for (const url of cands){
+    const raw = await rfMaybeJson(url);
+    if (raw && !_probeSample) _probeSample = `${url} => ${JSON.stringify(raw).slice(0, 800)}`;
     const data = await _kniFetch(url);
     if (data.length){ _kniUrl = url; _kni = { at: Date.now(), data }; console.log(`[notes] kart-note index endpoint: ${url.split('?')[0]} (${data.length} notes)`); return data; }
   }
   _kniUrl = '';
-  if (!_kniDiag){ _kniDiag = true; try { await rfDebug('kart_notes_index_fail', 0, `no kart_note_id source found; tried: ${cands.slice(0, 8).join('  ')}`, ''); } catch (e) {} }
+  if (!_kniDiag){ _kniDiag = true; try { await rfDebug('kart_notes_index_fail', 0, `no kart_note_id source. tried: ${cands.slice(0, 8).join('  ')} | probeSample: ${_probeSample.slice(0, 400)}`, _pageHtml); } catch (e) {} }
   _kni = { at: Date.now(), data: [] };
   return [];
 }
@@ -829,7 +840,7 @@ async function getKartNoteIndex({ probe = true } = {}){
 //   • detect DELETES (a note active in the DB that's gone from the page) -> re-fetch that kart to prune.
 // Returns karts synced, or null if the page yields no buttons (server-side table) so the caller falls back.
 async function notesFromKartNotesPage(){
-  const btns = (await getKartNoteIndex({ probe: false })).filter((b) => b.rfKartId != null && b.note != null);
+  const btns = (await getKartNoteIndex()).filter((b) => b.rfKartId != null && b.note != null);
   if (!btns.length) return null;
 
   // 1) Backfill kart_note_id onto active notes that don't have it yet (minimal writes; skips ones already set).
