@@ -762,7 +762,7 @@ async function rfMaybeJson(path){ try { const t = await (await rf(path, { ajax:t
 let _kni = { at: 0, data: [] };     // short cache of the resolved index
 let _kniUrl;                        // undefined=unprobed, ''=none found, else the working URL
 let _kniProbeAt = 0, _kniDiag = false;
-const _KNI_BACKOFF = 5 * 60 * 1000;
+const _KNI_BACKOFF = 60 * 1000;   // short: a failed probe should not lock deletes out of the id lookup for long
 
 function _kniParse(j, add){
   const items = j && (j.data || j.aaData || j.items || j.rows || j.records || (Array.isArray(j) ? j : null));
@@ -815,34 +815,39 @@ async function getKartNoteIndex({ probe = true } = {}){
     if (r.data.length){ _kni = { at: Date.now(), data: r.data }; return r.data; }
     _kniUrl = undefined;                                       // stopped working -> allow a reprobe
   }
-  if (!probe) return [];                                       // notes loop: never probe, only use a known endpoint
-  if (_kniUrl === '' && Date.now() - _kniProbeAt < _KNI_BACKOFF) return [];   // recently found nothing -> back off
+  if (!probe) return [];
+  if (_kniUrl === '' && Date.now() - _kniProbeAt < _KNI_BACKOFF) return [];
   _kniProbeAt = Date.now();
 
+  // The endpoint is CONFIRMED from a browser capture: GET /ajax/garage/kart-notes-table. Try it FIRST and
+  // ALONE — the earlier version discovered candidate URLs from the page and probed them all sequentially,
+  // which could stall the whole notes loop for a long time. Discovery is now a capped fallback only.
+  {
+    const r = await _kniFetch('/ajax/garage/kart-notes-table');
+    if (r.data.length){ _kniUrl = '/ajax/garage/kart-notes-table'; _kni = { at: Date.now(), data: r.data }; console.log(`[notes] kart-note index: ${r.data.length} notes via /ajax/garage/kart-notes-table`); return r.data; }
+    // It answered but we parsed nothing -> put the raw bytes where we can see them (Render log + rf_debug).
+    if (r.sample){ console.log(`[notes] kart-notes-table gave no parseable notes — sample: ${r.sample.slice(0, 220).replace(/\s+/g, ' ')}`); if (!_kniDiag){ _kniDiag = true; try { await rfDebug('kart_notes_table_sample', 0, 'kart-notes-table response did not parse — match these bytes', r.sample); } catch (e) {} } }
+  }
+
+  // Fallback discovery: read the page for inline buttons + a table ajax URL. Capped and filtered so it
+  // can never turn into a long sequential probe again.
   const out = [], seen = new Set();
   const add = (id, kart, note) => { const n = Number(id); if (!n || seen.has(n)) return false; seen.add(n); out.push({ kartNoteId: n, rfKartId: (kart != null && /^\d+$/.test(String(kart))) ? Number(kart) : null, note: note != null ? String(note) : null }); return true; };
-  let cands = ['/ajax/garage/kart-notes-table', '/ajax/garage/kart-notes-table?page=1&results=1000&search=', '/ajax/garage/notes_list/?page=1&results=1000&search=', '/ajax/garage/kart-notes_list/?page=1&results=1000&search=', '/ajax/garage/kart_notes_list/?page=1&results=1000&search='];
-  let _pageHtml = '';
+  let cands = [];
   try {
     const html = await (await rf('/en/administration/garage/kart-notes')).text();
-    _pageHtml = html;
-    for (const b of parseKartNoteButtons(html)) if (b.kartNoteId != null) add(b.kartNoteId, b.rfKartId, b.note);   // client-rendered case
+    for (const b of parseKartNoteButtons(html)) if (b.kartNoteId != null) add(b.kartNoteId, b.rfKartId, b.note);
     const disc = []; let m;
-    const re1 = /ajax\s*:\s*(?:\{[^}]*?url\s*:\s*)?["']([^"']+)["']/gi; while ((m = re1.exec(html))) disc.push(m[1]);
-    const re2 = /["'](\/ajax\/[a-z0-9_\/-]*note[a-z0-9_\/-]*)["']/gi; while ((m = re2.exec(html))) disc.push(m[1]);
-    const norm = disc.map((u) => u.includes('page=') ? u : (u + (u.includes('?') ? '&' : '/?') + 'page=1&results=1000&search='));
-    cands = [...new Set([...norm, ...cands])];
+    const re = /["'](\/ajax\/[a-z0-9_\/-]*note[a-z0-9_\/-]*(?:table|list)[a-z0-9_\/-]*)["']/gi;
+    while ((m = re.exec(html))) disc.push(m[1]);
+    cands = [...new Set(disc)].filter((u) => !/(add|delete|edit|create|update)/i.test(u)).slice(0, 4);
   } catch (e) {}
-  if (out.length){ _kniUrl = ''; _kni = { at: Date.now(), data: out }; return out; }   // page was client-rendered
-
-  let _probeSample = '';
+  if (out.length){ _kniUrl = ''; _kni = { at: Date.now(), data: out }; return out; }
   for (const url of cands){
     const r = await _kniFetch(url);
-    if (r.sample && !_probeSample) _probeSample = `${url} => ${r.sample}`;
-    if (r.data.length){ _kniUrl = url; _kni = { at: Date.now(), data: r.data }; console.log(`[notes] kart-note index endpoint: ${url.split('?')[0]} (${r.data.length} notes)`); return r.data; }
+    if (r.data.length){ _kniUrl = url; _kni = { at: Date.now(), data: r.data }; console.log(`[notes] kart-note index: ${r.data.length} notes via ${url}`); return r.data; }
   }
   _kniUrl = '';
-  if (!_kniDiag){ _kniDiag = true; try { await rfDebug('kart_notes_index_fail', 0, `no kart_note_id source. tried: ${cands.slice(0, 8).join('  ')} | probeSample: ${_probeSample.slice(0, 500)}`, _pageHtml); } catch (e) {} }
   _kni = { at: Date.now(), data: [] };
   return [];
 }

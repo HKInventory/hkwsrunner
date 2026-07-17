@@ -431,8 +431,9 @@ async function rfDeleteNote(row){
   }
 
   if ((nid == null || nid === '') && (knid == null || knid === '')) {
-    console.log(`[rf-push] note delete #${row.id}: no notification_id or kart_note_id resolvable — nothing to clear on RaceFacer (check rf_debug 'note_delete_html')`); return;
+    console.log(`[rf-push] note delete #${row.id}: no notification_id or kart_note_id resolvable — nothing to clear on RaceFacer (check rf_debug 'note_delete_html' / 'kart_notes_table_sample')`); return;
   }
+  console.log(`[rf-push] note delete #${row.id}: kart=${kartId} nid=${nid != null ? nid : '-'} knid=${knid != null ? knid : '-'} — firing clears`);
 
   // Auth is just the session cookie + the XSRF-TOKEN cookie echoed as X-XSRF-TOKEN (exactly what the
   // captured browser calls used). No kart-specific form token is needed — the previous code fetched one
