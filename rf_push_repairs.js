@@ -18,7 +18,7 @@
    ============================================================================ */
 const https = require('https');
 const { createClient } = require('@supabase/supabase-js');
-const { parseActiveNotes, parseKartNotes } = require('./racefacer-parse');
+const { parseActiveNotes, parseKartNotes, parseKartNoteButtons } = require('./racefacer-parse');
 const agent = new https.Agent({ rejectUnauthorized: false }); // self-signed cert on that IP
 
 const RF_BASE = (process.env.RF_BASE || 'https://103.166.146.163').replace(/\/$/, '');
@@ -356,6 +356,13 @@ async function rfAjaxJson(path){
   const t = await r.text();
   try { return JSON.parse(t); } catch { return { html: t }; }   // some endpoints answer with a bare HTML fragment
 }
+// Fetch a RaceFacer PAGE as HTML (no XHR header — page controllers can behave differently for XHR).
+async function rfGetHtml(path){
+  const r = await fetch(`${RF_BASE}${path}`, { agent, redirect:'manual', headers: rfHeaders({ Accept:'text/html,application/xhtml+xml,*/*' }) });
+  absorb(r);
+  if (r.status===401 || /login/i.test(r.headers.get('location')||'')) { loggedIn=false; throw new Error('session expired'); }
+  return await r.text();
+}
 const _normNote = (s) => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
 
 // Clear a note on RaceFacer — same as the app's X. A note lives in TWO places on RaceFacer and each has
@@ -408,11 +415,17 @@ async function rfDeleteNote(row){
         else if (!active.length || !active.some((a) => a.notifId != null)) { try { await rfDebug('note_delete_html', kartId, `kart-details active-notes: could not read notification_id (note "${String(row.note||'').slice(0,60)}")`, (dj && dj.html) || ''); } catch (e) {} }
       }
       if (knid == null) {
-        const nj = await rfAjaxJson(`/ajax/garage/kart-notes?id=${kartId}`);
-        const notes = parseKartNotes(nj || {});
-        const m = notes.find((n) => _normNote(n.note) === want) || (want ? notes.find((n) => _normNote(n.note).includes(want.slice(0, 40))) : null);
+        // The per-kart ajax has NO buttons/ids (that's why rf_kart_note_id is null everywhere). The GLOBAL
+        // Kart Notes page DOES carry them on each row's edit/delete button. Fetch it and match this kart+note.
+        const html = await rfGetHtml('/en/administration/garage/kart-notes');
+        const btns = parseKartNoteButtons(html);
+        const mine = btns.filter((b) => b.rfKartId == null || Number(b.rfKartId) === Number(kartId));
+        let m = mine.find((b) => _normNote(b.note) === want)
+             || (want ? mine.find((b) => b.note && (_normNote(b.note).includes(want.slice(0, 30)) || want.includes(_normNote(b.note).slice(0, 30)))) : null)
+             || (mine.length === 1 ? mine[0] : null)
+             || btns.find((b) => _normNote(b.note) === want) || null;
         if (m && m.kartNoteId != null) knid = m.kartNoteId;
-        else if (!notes.length || !notes.some((n) => n.kartNoteId != null)) { try { await rfDebug('note_delete_html', kartId, `kart-notes: could not read kart_note_id (note "${String(row.note||'').slice(0,60)}")`, (nj && nj.html) || JSON.stringify(nj || '')); } catch (e) {} }
+        else { try { await rfDebug('note_delete_html', kartId, `global kart-notes: no kart_note_id match for kart ${kartId} note "${String(row.note || '').slice(0, 60)}" (${btns.length} buttons parsed)`, html); } catch (e) {} }
       }
     } catch (e) { console.log(`[rf-push] note delete #${row.id}: live id lookup failed: ${e.message}`); }
   }

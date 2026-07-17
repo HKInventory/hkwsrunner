@@ -251,4 +251,25 @@ function parseNotificationsList(html) {
   return out;
 }
 
-module.exports = { parseKartDetails, parseRepairs, parseParts, parseKartNotes, parseActiveNotes, parseGarageStatuses, parseNotificationsList, analysePartWear };
+// The GLOBAL Kart Notes page (/en/administration/garage/kart-notes) carries each note's kart_note_id on
+// its edit/delete buttons — the per-kart /ajax/garage/kart-notes?id= endpoint the sync reads does NOT, so
+// this is where we source the id the notes/delete call needs. The edit anchor conveniently holds all of:
+//   data-id        = kart_note_id  (what notes/delete uses)
+//   data-kart-id   = RaceFacer kart id
+//   data-message   = the note text
+// e.g. <a onclick="show_edit_kart_note(this)" data-id="30151" data-kart-id="47" data-message="timing">
+function parseKartNoteButtons(html) {
+  const $ = cheerio.load(html || '');
+  const out = [];
+  $('a[onclick*="show_edit_kart_note"], a[onclick*="delete_kart_note"]').each((_, a) => {
+    const $a = $(a);
+    const id = $a.attr('data-id');
+    if (!id || !/^\d+$/.test(id)) return;
+    const kid = $a.attr('data-kart-id');
+    const msg = $a.attr('data-message');
+    out.push({ kartNoteId: Number(id), rfKartId: (kid != null && /^\d+$/.test(kid)) ? Number(kid) : null, note: msg != null ? msg : null });
+  });
+  return out;
+}
+
+module.exports = { parseKartDetails, parseRepairs, parseParts, parseKartNotes, parseActiveNotes, parseGarageStatuses, parseNotificationsList, parseKartNoteButtons, analysePartWear };
