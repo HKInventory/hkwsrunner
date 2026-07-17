@@ -742,14 +742,19 @@ async function readKartNotes(id){
     return await syncKartNotes(id, SITE, activeFps);
   } catch (e){ console.error(`[notes-readback] kart ${id}: ${e.message}`); return 0; }
 }
-// AUTHORITATIVE, CHEAP "note added" detector. One fetch of the global notifications list (newest first)
-// tells us which karts just got a note — so we pull ONLY those karts' details instead of blind-rotating
-// ~190 karts to stumble on a new note (the thing that made adds take ~2.5min). Returns the number of
-// karts synced, or null if the list can't be read (caller falls back to the flag/rotate path). Cost:
-// one page fetch per cycle (inbound ≈ free; outbound is just the request), plus a detail fetch only for
-// karts that actually changed.
+// AUTHORITATIVE, CHEAP note-change detector — handles ADDS *and* DELETES/clears. One fetch of the global
+// notifications list tells us the full current set of active notes fleet-wide, so we can:
+//   • ADD:    a note newer than our high-water -> pull that kart's detail (syncs the new note + its ids).
+//   • DELETE: a note we have as active in the DB whose notification_id is no longer on the list -> that
+//             note was cleared/deleted/repaired-away in RaceFacer -> re-fetch that kart so syncKartNotes
+//             prunes it (fires the realtime DELETE the app listens for). Re-fetching (rather than blind
+//             pruning) is authoritative, so even if the list were paginated it can never wrongly delete —
+//             the re-fetch just finds the note still there and keeps it.
+// Returns the number of karts synced, or null if the list can't be read (caller falls back to flag/rotate).
+// Cost: one page fetch per cycle (inbound ≈ free), plus a detail fetch only for karts that actually changed.
 let _notifHighWater = 0;      // epoch(ms) of the newest notification we've already acted on
 let _notifDiagDone = false;
+let _goneCursor = 0;
 async function notesFromNotifications(){
   let html;
   try { const r = await rf('/en/administration/garage/notifications'); html = await r.text(); }
@@ -771,27 +776,47 @@ async function notesFromNotifications(){
   if (!byNum.size) return null;
 
   const toEpoch = (iso) => { const t = Date.parse(iso); return isNaN(t) ? 0 : t; };
-  const newest = rows.reduce((m, r) => Math.max(m, toEpoch(r.dateIso)), 0);
-  // First successful read establishes the high-water mark — we do NOT backfill history (the heavy sync
-  // and the 15-min sweep own the backlog); we only act on notes that appear AFTER the runner is watching.
-  if (!_notifHighWater){ _notifHighWater = newest; return 0; }
-
-  const freshKarts = new Set();
-  for (const r of rows){
-    if (toEpoch(r.dateIso) <= _notifHighWater) continue;
+  const pickKart = (r) => {
     const cands = byNum.get(String(r.kartNumber || '').trim()) || [];
-    let pick = cands[0];
-    if (cands.length > 1 && r.kartType){
-      const want = r.kartType.toLowerCase().replace(/\s*track\s*/, '').trim();
-      pick = cands.find((c) => (c.type || '').toLowerCase().includes(want)) || cands[0];
+    if (cands.length <= 1) return cands[0];
+    if (r.kartType){ const want = r.kartType.toLowerCase().replace(/\s*track\s*/, '').trim(); return cands.find((c) => (c.type || '').toLowerCase().includes(want)) || cands[0]; }
+    return cands[0];
+  };
+  const newest = rows.reduce((m, r) => Math.max(m, toEpoch(r.dateIso)), 0);
+  const liveIds = new Set(rows.map((r) => r.notifId).filter((x) => x != null));   // notification_ids currently active on RaceFacer
+
+  const changed = new Set();
+
+  // --- DELETES: DB says active, but the id isn't on the current list any more -> re-fetch to prune. ---
+  // Gated on having parsed some ids (so a parse that missed ids can't nuke everything). Bounded per cycle.
+  if (liveIds.size){
+    try {
+      const active = (await sb('rf_kart_notes?active=eq.true&rf_notification_id=not.is.null&select=rf_kart_id,rf_notification_id')) || [];
+      const gone = [];
+      for (const n of active){ if (n.rf_notification_id != null && !liveIds.has(Number(n.rf_notification_id)) && n.rf_kart_id != null) gone.push(n.rf_kart_id); }
+      const goneKarts = [...new Set(gone)];
+      // Bound the per-cycle re-fetch so a pathological/paginated list can't cause a fetch storm; rotate
+      // through any overflow so a real delete is still caught within a cycle or two.
+      const CAP = 20;
+      let take = goneKarts;
+      if (goneKarts.length > CAP){ take = []; for (let i = 0; i < CAP; i++) take.push(goneKarts[(_goneCursor + i) % goneKarts.length]); _goneCursor = (_goneCursor + CAP) % goneKarts.length; }
+      for (const id of take) changed.add(id);
+    } catch (e){ /* delete-diff is best-effort; adds below still run */ }
+  }
+
+  // --- ADDS: a note newer than the high-water mark -> pull that kart. First read just sets the mark. ---
+  if (!_notifHighWater){ _notifHighWater = newest; }
+  else {
+    for (const r of rows){
+      if (toEpoch(r.dateIso) <= _notifHighWater) continue;
+      const pick = pickKart(r);
+      if (pick && pick.rf_id != null) changed.add(pick.rf_id);
     }
-    if (pick && pick.rf_id != null) freshKarts.add(pick.rf_id);
   }
   _notifHighWater = Math.max(_notifHighWater, newest);
-  if (!freshKarts.size) return 0;
 
-  // Pull details for exactly those karts (bounded concurrency) — this syncs the new note + its ids.
-  const ids = [...freshKarts]; let touched = 0, idx = 0;
+  if (!changed.size) return 0;
+  const ids = [...changed]; let touched = 0, idx = 0;
   async function w(){ while (idx < ids.length){ const id = ids[idx++]; await readKartNotes(id); touched++; } }
   await Promise.all(Array.from({ length: Math.min(6, ids.length) }, () => w()));
   return touched;
