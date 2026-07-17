@@ -355,45 +355,24 @@ async function rfNoteAction(row){
 async function rfDeleteNote(row){
   const nid = row.rf_notification_id != null ? row.rf_notification_id : row.notification_id;
   if (nid == null || nid === '') { console.log(`[rf-push] note delete #${row.id}: no notification_id — nothing to clear on RaceFacer`); return; }
-  const ctx = await formContext(row.rf_kart_id);   // CSRF token + kart context
+  const ctx = await formContext(row.rf_kart_id);            // session CSRF token (fallback auth)
+  const xsrf = decodeURIComponent(jar['XSRF-TOKEN'] || ''); // Laravel's cookie CSRF, echoed back as a header
 
-  // One-time: dump the kart-details active-notes markup so we can SEE the X button's real handler.
-  try {
-    if (!global.__noteDelCapDone) {
-      const rr = await fetch(`${RF_BASE}/ajax/garage/kart-details?id=${row.rf_kart_id}`, { agent, headers: rfHeaders({ Accept:'application/json' }), redirect:'manual' });
-      absorb(rr);
-      const { txt: dtxt, j: dj } = await rfBody(rr);
-      const html = (dj && dj.html) || dtxt || '';
-      await rfDebug('note_delete_html', row.rf_kart_id, `kart-details notes markup (X button = the real clear endpoint) for notif ${nid}`, String(html).slice(0, 20000));
-      global.__noteDelCapDone = true;
-    }
-  } catch (e) { /* diagnostic only */ }
-
-  const referer = `${RF_BASE}/en/administration/garage/garage?kart_id=${row.rf_kart_id}`;
-  const candidates = [
-    { url:`/ajax/garage/notes/delete`,        body:{ id:String(nid), note_id:String(nid), notification_id:String(nid), kart_id:String(row.rf_kart_id), _token:ctx.token } },
-    { url:`/ajax/garage/notification/delete`, body:{ id:String(nid), notification_id:String(nid), kart_id:String(row.rf_kart_id), _token:ctx.token } },
-    { url:`/ajax/notification/delete`,        body:{ id:String(nid), note_id:String(nid), _token:ctx.token } },
-    { url:`/ajax/garage/notes/remove`,        body:{ id:String(nid), note_id:String(nid), kart_id:String(row.rf_kart_id), _token:ctx.token } },
-  ];
-  let lastTxt = '';
-  for (const c of candidates){
-    try {
-      const r = await fetch(`${RF_BASE}${c.url}`, { method:'POST', agent, redirect:'manual',
-        headers: rfHeaders({ 'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8', 'X-CSRF-Token':ctx.token, Referer:referer }),
-        body: new URLSearchParams(c.body) });
-      absorb(r);
-      if (r.status===401 || /login/i.test(r.headers.get('location')||'')) { loggedIn=false; throw new Error('session expired'); }
-      const { txt, j } = await rfBody(r);
-      lastTxt = `${c.url} -> ${r.status} ${String(txt).slice(0,180)}`;
-      if (r.status >= 200 && r.status < 400 && !rfFailure(r.status, txt, j)) {
-        console.log(`[rf-push] note ${nid} cleared on RaceFacer via ${c.url}`);
-        return;   // success — the note is gone on RF, so the next read-back won't resurrect it
-      }
-    } catch (e){ if (/session expired/.test(e.message||'')) throw e; lastTxt = `${c.url} threw ${e.message}`; }
-  }
-  await rfDebug('note_delete', row.rf_kart_id, `no clear endpoint matched for notif ${nid} — see note_delete_html for the X button`, lastTxt);
-  throw new Error(`note delete: no endpoint matched (check rf_debug note_delete_html)`);
+  // RaceFacer's real "clear note" call, captured from the X button on the kart-details note row:
+  //   POST /ajax/garage/notifications/delete-notification   Content-Type: application/json
+  //   body {"kart_id","notification_id"}   auth via X-XSRF-TOKEN (decoded XSRF-TOKEN cookie).
+  // We also send X-CSRF-Token=ctx.token as a belt-and-braces fallback (Laravel accepts either).
+  const r = await fetch(`${RF_BASE}/ajax/garage/notifications/delete-notification`, { method:'POST', agent, redirect:'manual',
+    headers: rfHeaders({ 'Content-Type':'application/json', Accept:'application/json, text/plain, */*',
+      'X-XSRF-TOKEN': xsrf, 'X-CSRF-Token': ctx.token,
+      Referer:`${RF_BASE}/en/administration/garage/garage` }),
+    body: JSON.stringify({ kart_id:String(row.rf_kart_id), notification_id:String(nid) }) });
+  absorb(r);
+  if (r.status===401 || /login/i.test(r.headers.get('location')||'')) { loggedIn=false; throw new Error('session expired'); }
+  const { txt, j } = await rfBody(r);
+  const fail = rfFailure(r.status, txt, j);
+  if (fail){ await rfDebug('note_delete', row.rf_kart_id, `delete-notification refused for notif ${nid}: ${fail}`, txt); throw new Error(`delete-notification: ${fail}`); }
+  console.log(`[rf-push] note ${nid} cleared on RaceFacer (kart ${row.rf_kart_id})`);
 }
 async function rfCreateDamage(row){
   const ctx = await formContext(row.rf_kart_id);
