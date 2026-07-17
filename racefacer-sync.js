@@ -624,16 +624,21 @@ async function syncKartNotes(id, site, activeFps) {
       active: activeSet.has(fp),
       // RaceFacer's notification id — the number that lets a repair CLEAR this note. Null when the
       // note isn't in the active list or the id couldn't be read from the markup.
-      rf_notification_id: (isMap && activeFps.get(fp) != null) ? activeFps.get(fp) : null });
+      rf_notification_id: (isMap && activeFps.get(fp) != null) ? activeFps.get(fp) : null,
+      // RaceFacer's kart-note id (data-id on the row's edit/delete button) — DISTINCT from the
+      // notification id. This is what the Kart Notes page X sends to /ajax/garage/notes/delete, so the
+      // pusher needs it to clear the note from the Kart Notes list (the notification id only clears it
+      // from Notifications). Populated for every row that carries the button; null otherwise.
+      rf_kart_note_id: (n.kartNoteId != null ? n.kartNoteId : null) });
   }
   if (rows.length) {
     try {
       await sb('rf_kart_notes?on_conflict=note_fp', { method: 'POST', prefer: 'resolution=merge-duplicates', body: rows });
     } catch (e) {
-      // If the rf_notification_id column hasn't been added yet (rf_debug.sql part 0), retry without
-      // it so note syncing never stalls on a missing migration.
-      if (/rf_notification_id/.test(e.message || '')) {
-        const bare = rows.map(({ rf_notification_id, ...r }) => r);
+      // If the rf_notification_id / rf_kart_note_id columns haven't been added yet (rf_note_queue_action.sql),
+      // retry without them so note syncing never stalls on a missing migration.
+      if (/rf_notification_id|rf_kart_note_id/.test(e.message || '')) {
+        const bare = rows.map(({ rf_notification_id, rf_kart_note_id, ...r }) => r);
         await sb('rf_kart_notes?on_conflict=note_fp', { method: 'POST', prefer: 'resolution=merge-duplicates', body: bare });
       } else throw e;
     }

@@ -125,7 +125,16 @@ function parseKartNotes(json) {
     const c = when($(tds[1]).text());
     const a = when($(tds[2]).text());
     if (!note && !c.iso) return;
-    out.push({ note, createdIso: c.iso, createdBy: c.by, archivedIso: a.iso, archivedBy: a.by, archived: !!a.iso });
+    // RaceFacer's KART-NOTE id (distinct from the notification id) — the number the Kart Notes page
+    // X sends to /ajax/garage/notes/delete as kart_note_id. It rides on the row's edit + delete
+    // anchors as data-id, e.g. <a onclick="delete_kart_note(this)" data-id="30151">. Prefer the id
+    // sitting next to one of those handlers; fall back to the first data-id in the row (data-kart-id /
+    // data-kart-type never match the literal `data-id="` token).
+    const rowHtml = $.html(tr) || '';
+    const km = rowHtml.match(/(?:delete_kart_note|show_edit_kart_note)\([^)]*\)"\s*data-id="(\d+)"/)
+            || rowHtml.match(/data-id="(\d+)"/);
+    const kartNoteId = km ? Number(km[1]) : null;
+    out.push({ note, createdIso: c.iso, createdBy: c.by, archivedIso: a.iso, archivedBy: a.by, archived: !!a.iso, kartNoteId });
   });
   return out;
 }
