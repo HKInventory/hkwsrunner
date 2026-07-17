@@ -752,23 +752,26 @@ async function notesFast(garageFlags) {
   try { dbActive = (await sb('rf_kart_notes?active=eq.true&select=rf_kart_id')) || []; } catch (e) {}
   const dbFlag = new Set(dbActive.map((r) => r.rf_kart_id).filter((x) => x != null));
 
-  // Always re-check karts the DB believes have an open note: that's where an EDIT or the LAST note
-  // being cleared shows up, and it also catches a note cleared in RaceFacer (the list flag drops but
-  // the DB row lingers until we re-fetch and prune it).
-  const toCheck = new Set(dbFlag);
-  // A kart the LIST page flags as having a note but the DB does NOT = a brand-new note. Fetch it now.
-  if (garageFlags && garageFlags.size) for (const id of garageFlags) if (!dbFlag.has(id)) toCheck.add(id);
-
-  // If the list page actually exposed note-flags this cycle, they're authoritative — every kart with
-  // note activity (new, edited, or cleared) is already in toCheck, so we fetch ONLY those. A quiet
-  // fleet costs ~zero requests and a new note lands within one cycle (~10s). If the parser found NO
-  // flags (the list markup carries no note indicator), fall back to a rotating sweep so brand-new
-  // notes on a clean kart are still caught within a full rotation.
   const sawFlags = !!(statusFast && statusFast._sawFlags);
-  if (!sawFlags) {
-    const BATCH = parseInt(process.env.NOTES_FAST_BATCH, 10) || 24;   // karts swept per blind cycle
+  const toCheck = new Set();
+  if (sawFlags) {
+    // Authoritative list-flags => fetch ONLY karts whose note state CHANGED since the DB was written:
+    //   • flagged on the list but NOT in the DB  -> a NEW note appeared -> fetch + write it.
+    //   • in the DB but NO LONGER flagged        -> the note was CLEARED -> fetch + prune it.
+    // Karts flagged in BOTH are unchanged and skipped, so a stable fleet costs ZERO detail fetches —
+    // that's what makes a fast poll cheap. (A note EDITED in place keeps its flag; the ~15min full
+    // sweep reconciles those.) A missed flag just lands a kart in the "cleared" set and re-fetches it;
+    // the fetch re-reads the REAL notes, so nothing is ever wrongly pruned.
+    if (garageFlags) for (const id of garageFlags) if (!dbFlag.has(id)) toCheck.add(id);   // new note
+    for (const id of dbFlag) if (!(garageFlags && garageFlags.has(id))) toCheck.add(id);    // cleared
+  } else {
+    // No note indicator on the list this cycle: re-check every DB-tracked kart (catches edits + clears)
+    // plus a rotating batch of the rest so a brand-new note on a clean kart is still found within a
+    // full rotation.
+    for (const id of dbFlag) toCheck.add(id);
+    const BATCH = parseInt(process.env.NOTES_FAST_BATCH, 10) || 24;
     for (let i = 0; i < BATCH && i < fleet.length; i++) toCheck.add(fleet[(_noteCursor + i) % fleet.length]);
-    _noteCursor = (_noteCursor + BATCH) % fleet.length;   // advance for next cycle
+    _noteCursor = (_noteCursor + BATCH) % fleet.length;
   }
 
   const ids = [...toCheck];
