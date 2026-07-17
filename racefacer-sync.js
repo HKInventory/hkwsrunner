@@ -12,7 +12,7 @@ const { fetch, Agent } = require('undici');
 const crypto = require('crypto');
 // Short stable hash of a repair row's content — a changed field (incl. mechanic) changes the hash.
 function contentHash(s){ return crypto.createHash('sha1').update(String(s)).digest('base64').slice(0, 20); }
-const { parseKartDetails, parseRepairs, parseParts, parseKartNotes, parseActiveNotes, parseGarageStatuses, parseNotificationsList } = require('./racefacer-parse');
+const { parseKartDetails, parseRepairs, parseParts, parseKartNotes, parseActiveNotes, parseGarageStatuses, parseNotificationsList, parseKartNoteButtons } = require('./racefacer-parse');
 const { reconcileDay } = require('./racefacer-reconcile');
 
 const RF_BASE = process.env.RF_BASE || 'https://103.166.146.163';
@@ -742,31 +742,136 @@ async function readKartNotes(id){
     return await syncKartNotes(id, SITE, activeFps);
   } catch (e){ console.error(`[notes-readback] kart ${id}: ${e.message}`); return 0; }
 }
-// AUTHORITATIVE, CHEAP note-change detector — handles ADDS *and* DELETES/clears. One fetch of the global
-// notifications list tells us the full current set of active notes fleet-wide, so we can:
-//   • ADD:    a note newer than our high-water -> pull that kart's detail (syncs the new note + its ids).
-//   • DELETE: a note we have as active in the DB whose notification_id is no longer on the list -> that
-//             note was cleared/deleted/repaired-away in RaceFacer -> re-fetch that kart so syncKartNotes
-//             prunes it (fires the realtime DELETE the app listens for). Re-fetching (rather than blind
-//             pruning) is authoritative, so even if the list were paginated it can never wrongly delete —
-//             the re-fetch just finds the note still there and keeps it.
-// Returns the number of karts synced, or null if the list can't be read (caller falls back to flag/rotate).
-// Cost: one page fetch per cycle (inbound ≈ free), plus a detail fetch only for karts that actually changed.
+// Module-level state for the note detectors below.
 let _notifHighWater = 0;      // epoch(ms) of the newest notification we've already acted on
 let _notifDiagDone = false;
 let _goneCursor = 0;
+let _knPageDiagDone = false;
+const _normNote = (s) => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+function _noteMatch(a, b){ a = _normNote(a); b = _normNote(b); if (!a || !b) return false; if (a === b) return true; const n = Math.min(a.length, b.length, 30); return n >= 6 && a.slice(0, n) === b.slice(0, n); }   // data-message on the page can be truncated -> prefix match
+
+// One GET, parsed as JSON if possible, else null (no retry/throw — for probing candidate endpoints).
+async function rfMaybeJson(path){ try { const t = await (await rf(path, { ajax:true })).text(); return JSON.parse(t); } catch { return null; } }
+
+// FLEET NOTE INDEX: [{kartNoteId, rfKartId, note}] for every note, so we can resolve the kart_note_id the
+// app->RF delete needs and backfill it into the DB. The Kart Notes management PAGE renders its rows over
+// AJAX (not in the page HTML), so we discover/try RaceFacer's notes-list JSON endpoint — same family as
+// /ajax/garage/repairs_list. We PROBE for the working endpoint at most occasionally (a delete triggers a
+// probe); once found it's memoised and just re-fetched cheaply. The notes loop calls with {probe:false} so
+// it never pays the discovery cost — it only benefits once a probe has found the endpoint.
+let _kni = { at: 0, data: [] };     // short cache of the resolved index
+let _kniUrl;                        // undefined=unprobed, ''=none found, else the working URL
+let _kniProbeAt = 0, _kniDiag = false;
+const _KNI_BACKOFF = 5 * 60 * 1000;
+
+function _kniParse(j, add){
+  const items = j && (j.data || j.items || j.rows || (Array.isArray(j) ? j : null));
+  if (!Array.isArray(items) || !items.length) return false;
+  let any = false;
+  for (const it of items){
+    if (it && typeof it === 'object' && !Array.isArray(it)){
+      const id = it.id != null ? it.id : (it.kart_note_id != null ? it.kart_note_id : it.note_id);
+      const kart = it.kart_id != null ? it.kart_id : (it.kart_garage_id != null ? it.kart_garage_id : it.rf_kart_id);
+      const note = it.note != null ? it.note : (it.message != null ? it.message : (it.annotation != null ? it.annotation : it.description));
+      if (id != null && add(id, kart, note)) any = true;
+    } else if (Array.isArray(it)){
+      for (const b of parseKartNoteButtons(it.join(' '))) if (b.kartNoteId != null && add(b.kartNoteId, b.rfKartId, b.note)) any = true;
+    }
+  }
+  return any;
+}
+async function _kniFetch(url){
+  const out = [], seen = new Set();
+  const add = (id, kart, note) => { const n = Number(id); if (!n || seen.has(n)) return false; seen.add(n); out.push({ kartNoteId: n, rfKartId: (kart != null && /^\d+$/.test(String(kart))) ? Number(kart) : null, note: note != null ? String(note) : null }); return true; };
+  _kniParse(await rfMaybeJson(url), add);
+  return out;
+}
+async function getKartNoteIndex({ probe = true } = {}){
+  if (_kni.data.length && Date.now() - _kni.at < 4000) return _kni.data;
+  if (typeof _kniUrl === 'string' && _kniUrl){                 // known-good endpoint -> just refetch it
+    const data = await _kniFetch(_kniUrl);
+    if (data.length){ _kni = { at: Date.now(), data }; return data; }
+    _kniUrl = undefined;                                       // stopped working -> allow a reprobe
+  }
+  if (!probe) return [];                                       // notes loop: never probe, only use a known endpoint
+  if (_kniUrl === '' && Date.now() - _kniProbeAt < _KNI_BACKOFF) return [];   // recently found nothing -> back off
+  _kniProbeAt = Date.now();
+
+  const out = [], seen = new Set();
+  const add = (id, kart, note) => { const n = Number(id); if (!n || seen.has(n)) return false; seen.add(n); out.push({ kartNoteId: n, rfKartId: (kart != null && /^\d+$/.test(String(kart))) ? Number(kart) : null, note: note != null ? String(note) : null }); return true; };
+  let cands = ['/ajax/garage/notes_list/?page=1&results=1000&search=', '/ajax/garage/kart-notes_list/?page=1&results=1000&search=', '/ajax/garage/kart_notes_list/?page=1&results=1000&search=', '/ajax/garage/notes/list?page=1&results=1000'];
+  try {
+    const html = await (await rf('/en/administration/garage/kart-notes')).text();
+    for (const b of parseKartNoteButtons(html)) if (b.kartNoteId != null) add(b.kartNoteId, b.rfKartId, b.note);   // client-rendered case
+    const disc = []; let m;
+    const re1 = /ajax\s*:\s*(?:\{[^}]*?url\s*:\s*)?["']([^"']+)["']/gi; while ((m = re1.exec(html))) disc.push(m[1]);
+    const re2 = /["'](\/ajax\/[a-z0-9_\/-]*note[a-z0-9_\/-]*)["']/gi; while ((m = re2.exec(html))) disc.push(m[1]);
+    const norm = disc.map((u) => u.includes('page=') ? u : (u + (u.includes('?') ? '&' : '/?') + 'page=1&results=1000&search='));
+    cands = [...new Set([...norm, ...cands])];
+  } catch (e) {}
+  if (out.length){ _kniUrl = ''; _kni = { at: Date.now(), data: out }; return out; }   // page was client-rendered -> use its buttons; no ajax url to memo
+
+  for (const url of cands){
+    const data = await _kniFetch(url);
+    if (data.length){ _kniUrl = url; _kni = { at: Date.now(), data }; console.log(`[notes] kart-note index endpoint: ${url.split('?')[0]} (${data.length} notes)`); return data; }
+  }
+  _kniUrl = '';
+  if (!_kniDiag){ _kniDiag = true; try { await rfDebug('kart_notes_index_fail', 0, `no kart_note_id source found; tried: ${cands.slice(0, 8).join('  ')}`, ''); } catch (e) {} }
+  _kni = { at: Date.now(), data: [] };
+  return [];
+}
+
+// PRIMARY note detector — the GLOBAL Kart Notes page (/en/administration/garage/kart-notes). Its rows carry,
+// on the edit/delete buttons, everything we need: kart_note_id (data-id), rf kart id (data-kart-id) and the
+// note text (data-message). One cheap fetch therefore lets us, fleet-wide and without blind rotation:
+//   • BACKFILL rf_kart_note_id onto stored notes (so app->RF deletes clear the Kart Notes list reliably),
+//   • detect ADDS  (a note on the page that isn't active in the DB)  -> fetch that kart,
+//   • detect DELETES (a note active in the DB that's gone from the page) -> re-fetch that kart to prune.
+// Returns karts synced, or null if the page yields no buttons (server-side table) so the caller falls back.
+async function notesFromKartNotesPage(){
+  const btns = (await getKartNoteIndex({ probe: false })).filter((b) => b.rfKartId != null && b.note != null);
+  if (!btns.length) return null;
+
+  // 1) Backfill kart_note_id onto active notes that don't have it yet (minimal writes; skips ones already set).
+  try {
+    const need = (await sb('rf_kart_notes?active=eq.true&rf_kart_note_id=is.null&select=id,rf_kart_id,note')) || [];
+    for (const n of need){
+      const m = btns.find((b) => Number(b.rfKartId) === Number(n.rf_kart_id) && _noteMatch(b.note, n.note));
+      if (m && m.kartNoteId != null){ try { await sb(`rf_kart_notes?id=eq.${n.id}`, { method:'PATCH', prefer:'return=minimal', body:{ rf_kart_note_id: m.kartNoteId } }); } catch (e) {} }
+    }
+  } catch (e) {}
+
+  // 2) Diff the page's current notes against the DB's active set -> fetch only karts that changed.
+  let dbActive = [];
+  try { dbActive = (await sb('rf_kart_notes?active=eq.true&select=rf_kart_id,note')) || []; } catch (e){ return 0; }
+  const keyOf = (kart, note) => `${kart}|${_normNote(note)}`;
+  const dbKeys = new Set(dbActive.map((n) => keyOf(n.rf_kart_id, n.note)));
+  const pageKeys = new Set(btns.map((b) => keyOf(b.rfKartId, b.note)));
+  const changed = new Set();
+  for (const b of btns){ if (!dbKeys.has(keyOf(b.rfKartId, b.note))) changed.add(Number(b.rfKartId)); }         // new/edited note on RF
+  for (const n of dbActive){ if (!pageKeys.has(keyOf(n.rf_kart_id, n.note))) changed.add(Number(n.rf_kart_id)); } // note gone from RF
+  const ids = [...changed].filter((x) => x != null && !Number.isNaN(x));
+  if (!ids.length) return 0;
+  let touched = 0, idx = 0;
+  async function w(){ while (idx < ids.length){ const id = ids[idx++]; await readKartNotes(id); touched++; } }
+  await Promise.all(Array.from({ length: Math.min(6, ids.length) }, () => w()));
+  return touched;
+}
+
+let _notifBackoffUntil = 0, _notifMiss = 0;
 async function notesFromNotifications(){
+  if (Date.now() < _notifBackoffUntil) return null;   // page proven unreadable recently -> don't refetch every cycle
   let html;
   try { const r = await rf('/en/administration/garage/notifications'); html = await r.text(); }
   catch (e){ return null; }
   if (/name=["']password["']|\/auth\/login/i.test(html || '')) throw new Error('session expired');
   const rows = parseNotificationsList(html);
   if (!rows.length){
-    // Table came back empty — likely a client-side (AJAX) DataTable, so the rows aren't in the page HTML.
-    // Dump the page ONCE so the real data source can be wired, then fall back to the flag/rotate path.
     if (!_notifDiagDone){ _notifDiagDone = true; try { await rfDebug('notifications_page_html', 0, 'notifications page returned no parseable rows — wire the real (AJAX?) source from this', html); } catch (e) {} }
+    if (++_notifMiss >= 3) _notifBackoffUntil = Date.now() + 5 * 60 * 1000;   // stop hammering a client-rendered table
     return null;
   }
+  _notifMiss = 0;
   // kart NUMBER -> rf_id (+ type) from the fleet, to translate the list's "Kart" column into an rf id.
   let byNum = new Map();
   try {
@@ -1022,4 +1127,4 @@ async function main() {
 }
 
 if (require.main === module) main().catch((e) => { console.error(e); process.exit(1); });
-module.exports = { login, rfJson, enumerateKarts, syncKart, statusFast, reconcileToday, logTrackSegments, refreshLiveTracks, sweepNotesAll, notesFast, notesFromNotifications, readKartNotes };
+module.exports = { login, rfJson, enumerateKarts, syncKart, statusFast, reconcileToday, logTrackSegments, refreshLiveTracks, sweepNotesAll, notesFast, notesFromNotifications, notesFromKartNotesPage, getKartNoteIndex, readKartNotes };

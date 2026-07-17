@@ -415,17 +415,17 @@ async function rfDeleteNote(row){
         else if (!active.length || !active.some((a) => a.notifId != null)) { try { await rfDebug('note_delete_html', kartId, `kart-details active-notes: could not read notification_id (note "${String(row.note||'').slice(0,60)}")`, (dj && dj.html) || ''); } catch (e) {} }
       }
       if (knid == null) {
-        // The per-kart ajax has NO buttons/ids (that's why rf_kart_note_id is null everywhere). The GLOBAL
-        // Kart Notes page DOES carry them on each row's edit/delete button. Fetch it and match this kart+note.
-        const html = await rfGetHtml('/en/administration/garage/kart-notes');
-        const btns = parseKartNoteButtons(html);
-        const mine = btns.filter((b) => b.rfKartId == null || Number(b.rfKartId) === Number(kartId));
+        // Resolve kart_note_id via the sync module's fleet note index (tries RaceFacer's notes-list JSON
+        // endpoint, since the page renders its rows over AJAX and has none in its HTML). Match this kart+note.
+        let idx = [];
+        try { const s = require('./racefacer-sync'); if (typeof s.getKartNoteIndex === 'function') idx = await s.getKartNoteIndex(); } catch (e) {}
+        const mine = idx.filter((b) => b.rfKartId == null || Number(b.rfKartId) === Number(kartId));
         let m = mine.find((b) => _normNote(b.note) === want)
              || (want ? mine.find((b) => b.note && (_normNote(b.note).includes(want.slice(0, 30)) || want.includes(_normNote(b.note).slice(0, 30)))) : null)
              || (mine.length === 1 ? mine[0] : null)
-             || btns.find((b) => _normNote(b.note) === want) || null;
+             || idx.find((b) => _normNote(b.note) === want) || null;
         if (m && m.kartNoteId != null) knid = m.kartNoteId;
-        else { try { await rfDebug('note_delete_html', kartId, `global kart-notes: no kart_note_id match for kart ${kartId} note "${String(row.note || '').slice(0, 60)}" (${btns.length} buttons parsed)`, html); } catch (e) {} }
+        else { try { await rfDebug('note_delete_html', kartId, `no kart_note_id for kart ${kartId} note "${String(row.note || '').slice(0, 60)}" (${idx.length} indexed)`, ''); } catch (e) {} }
       }
     } catch (e) { console.log(`[rf-push] note delete #${row.id}: live id lookup failed: ${e.message}`); }
   }

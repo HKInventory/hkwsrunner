@@ -132,12 +132,19 @@ async function notesLoop(){
     try {
       await ensureLogin();
       // 1) authoritative fleet-wide detector — handles ADDS *and* DELETES in one cheap request.
-      let viaList = null;
-      if (typeof sync.notesFromNotifications === 'function') {
-        try { viaList = await sync.notesFromNotifications(); } catch (e) { viaList = null; log(`notes-list error: ${e.message}`); if (/login|session|401|403/i.test(e.message || '')) dropLogin(); }
+      //    Prefer the global Kart Notes page (real, parseable, and also backfills kart_note_id); fall back
+      //    to the notifications list if that page can't be read.
+      let viaList = null, listSrc = null;
+      if (typeof sync.notesFromKartNotesPage === 'function') {
+        try { viaList = await sync.notesFromKartNotesPage(); if (viaList != null) listSrc = 'kart-notes-page'; }
+        catch (e) { viaList = null; log(`notes-page error: ${e.message}`); if (/login|session|401|403/i.test(e.message || '')) dropLogin(); }
       }
-      // 2) fallback ONLY when the list couldn't be read — flag-diff for adds/clears, else gentle rotation.
-      //    When the list works it already covers adds+deletes, so we skip this entirely (cheaper + faster).
+      if (viaList == null && typeof sync.notesFromNotifications === 'function') {
+        try { viaList = await sync.notesFromNotifications(); if (viaList != null) listSrc = 'notifications-list'; }
+        catch (e) { viaList = null; log(`notes-list error: ${e.message}`); if (/login|session|401|403/i.test(e.message || '')) dropLogin(); }
+      }
+      // 2) fallback ONLY when neither list could be read — flag-diff for adds/clears, else gentle rotation.
+      //    When a list works it already covers adds+deletes, so we skip this entirely (cheaper + faster).
       let touched = 0;
       if (viaList == null) {
         try { touched = await sync.notesFast(sync.statusFast && sync.statusFast._noteFlags); }
@@ -146,10 +153,10 @@ async function notesLoop(){
 
       const flagged = !!(sync.statusFast && sync.statusFast._sawFlags);
       haveSignal = (viaList != null) || flagged;
-      const mode = viaList != null ? 'notifications-list' : (flagged ? 'list-flagged' : 'rotating');
+      const mode = listSrc || (flagged ? 'list-flagged' : 'rotating');
       if (mode !== _lastNotesMode) { _lastNotesMode = mode; log(`notes detection mode: ${mode}`); }
       ticks++;
-      if (viaList) log(`notes: ${viaList} kart(s) changed & synced (notifications-list)`);
+      if (viaList) log(`notes: ${viaList} kart(s) changed & synced (${mode})`);
       else if (touched && (ticks % 15 === 0)) log(`notes: ${touched} kart(s) re-synced (${mode})`);
 
       // wall-clock safety-net full sweep
