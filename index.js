@@ -85,7 +85,11 @@ function sleep(ms){ return new Promise((r) => setTimeout(r, ms)); }
 // STATUS loop — tight and independent. Just the ~5 garage list pages + write-changed status. This no
 // longer waits on notes, so a status flip in RaceFacer reaches the app in ~one STATUS_POLL (~3s) no
 // matter what the notes loop is doing. statusFast() also parses per-kart note-flags off the SAME pages
-// (free) and stashes them on statusFast._noteFlags for the notes loop to consume.
+// (free) and stashes them on statusFast._noteFlags for the notes loop to consume. refreshLiveTracks
+// (session-schedule fetch + track writes) is comparatively slow and only changes minute-to-minute, so it
+// runs on its own ~15s cadence rather than padding every status cycle.
+const LIVE_TRACKS_MS = Math.max(8000, (parseInt(process.env.LIVE_TRACKS_SEC || '15', 10)) * 1000);
+let _lastLiveTracks = 0;
 async function statusLoop(){
   let fails = 0;
   while (!stopping){
@@ -94,7 +98,10 @@ async function statusLoop(){
       await ensureLogin();
       const changed = await sync.statusFast();
       if (changed) log(`status: ${changed} kart(s) changed`);
-      if (typeof sync.refreshLiveTracks === 'function') { try { await sync.refreshLiveTracks(); } catch (e) {} }
+      if (typeof sync.refreshLiveTracks === 'function' && Date.now() - _lastLiveTracks >= LIVE_TRACKS_MS) {
+        _lastLiveTracks = Date.now();
+        try { await sync.refreshLiveTracks(); } catch (e) {}
+      }
       fails = 0;
     } catch (e){
       fails++;
@@ -124,23 +131,25 @@ async function notesLoop(){
     let haveSignal = false;
     try {
       await ensureLogin();
-      // 1) authoritative fleet-wide "note added" detector (one cheap request)
+      // 1) authoritative fleet-wide detector — handles ADDS *and* DELETES in one cheap request.
       let viaList = null;
       if (typeof sync.notesFromNotifications === 'function') {
         try { viaList = await sync.notesFromNotifications(); } catch (e) { viaList = null; log(`notes-list error: ${e.message}`); if (/login|session|401|403/i.test(e.message || '')) dropLogin(); }
       }
-      // 2) flag-diff / rotating fallback (also catches clears + in-place resolves). Suppress the blind
-      //    rotation when the notifications list already handled adds this cycle (no double-fetch).
+      // 2) fallback ONLY when the list couldn't be read — flag-diff for adds/clears, else gentle rotation.
+      //    When the list works it already covers adds+deletes, so we skip this entirely (cheaper + faster).
       let touched = 0;
-      try { touched = await sync.notesFast(sync.statusFast && sync.statusFast._noteFlags, { noRotate: viaList != null }); }
-      catch (e) { log(`notes error: ${e.message}`); if (/login|session|401|403/i.test(e.message || '')) dropLogin(); }
+      if (viaList == null) {
+        try { touched = await sync.notesFast(sync.statusFast && sync.statusFast._noteFlags); }
+        catch (e) { log(`notes error: ${e.message}`); if (/login|session|401|403/i.test(e.message || '')) dropLogin(); }
+      }
 
       const flagged = !!(sync.statusFast && sync.statusFast._sawFlags);
       haveSignal = (viaList != null) || flagged;
       const mode = viaList != null ? 'notifications-list' : (flagged ? 'list-flagged' : 'rotating');
       if (mode !== _lastNotesMode) { _lastNotesMode = mode; log(`notes detection mode: ${mode}`); }
       ticks++;
-      if (viaList) log(`notes: ${viaList} new note(s) pulled (notifications-list)`);
+      if (viaList) log(`notes: ${viaList} kart(s) changed & synced (notifications-list)`);
       else if (touched && (ticks % 15 === 0)) log(`notes: ${touched} kart(s) re-synced (${mode})`);
 
       // wall-clock safety-net full sweep
