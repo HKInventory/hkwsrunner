@@ -848,20 +848,11 @@ async function notesFast(garageFlags, opts) {
     // the fetch re-reads the REAL notes, so nothing is ever wrongly pruned.
     if (garageFlags) for (const id of garageFlags) if (!dbFlag.has(id)) toCheck.add(id);   // new note
     for (const id of dbFlag) if (!(garageFlags && garageFlags.has(id))) toCheck.add(id);    // cleared
-    // ALSO re-check karts the DB believes still have an OPEN note. A note RESOLVED in place — e.g. a
-    // repair punched straight into RaceFacer clears the note but the kart often still carries a note
-    // flag on the list — won't show up in the flag diff above, so without this it lingers until the
-    // 15-min sweep. Open-note karts are few, so when there are only a handful we re-check them ALL
-    // every cycle (resolutions clear in ~one poll); past that we rotate a third each cycle to bound cost.
-    const act = [...dbFlag];
-    if (act.length) {
-      if (act.length <= 8) { for (const id of act) toCheck.add(id); }
-      else {
-        const SLICE = Math.ceil(act.length / 3);
-        for (let i = 0; i < SLICE; i++) toCheck.add(act[(_noteCursor + i) % act.length]);
-        _noteCursor = (_noteCursor + SLICE) % act.length;
-      }
-    }
+    // ALSO re-check EVERY kart the DB believes still has an OPEN note, every cycle. A note deleted or
+    // resolved in RaceFacer (repair punched in) clears it but often leaves the list-flag, so it wouldn't
+    // show in the flag diff above — re-checking all open-note karts catches those in ~one poll. This set
+    // is bounded (only karts that currently have a note), and the fetch loop below runs it concurrently.
+    for (const id of dbFlag) toCheck.add(id);
   } else {
     // No note indicator on the list this cycle: always re-check DB-tracked open notes (catches edits +
     // clears + in-place resolves). Add a rotating batch to CATCH NEW notes too — but only when we don't
@@ -876,12 +867,13 @@ async function notesFast(garageFlags, opts) {
   }
 
   const ids = [...toCheck];
-  let touched = 0;
-  for (const id of ids) {
-    await readKartNotes(id);   // never throws; syncs this kart's notes back
-    touched++;
-    await sleep(80);
-  }
+  if (!ids.length) return 0;
+  // Fetch concurrently (bounded) rather than one-at-a-time with sleeps — a delete/resolve should clear in
+  // ~one poll, not drip out over several seconds. readKartNotes never throws.
+  const CONC = Math.max(2, Math.min(10, parseInt(process.env.NOTES_CONCURRENCY, 10) || 8));
+  let touched = 0, idx = 0;
+  async function worker(){ while (idx < ids.length){ const id = ids[idx++]; await readKartNotes(id); touched++; } }
+  await Promise.all(Array.from({ length: Math.min(CONC, ids.length) }, () => worker()));
   return touched;
 }
 
