@@ -765,7 +765,7 @@ let _kniProbeAt = 0, _kniDiag = false;
 const _KNI_BACKOFF = 5 * 60 * 1000;
 
 function _kniParse(j, add){
-  const items = j && (j.data || j.items || j.rows || (Array.isArray(j) ? j : null));
+  const items = j && (j.data || j.aaData || j.items || j.rows || j.records || (Array.isArray(j) ? j : null));
   if (!Array.isArray(items) || !items.length) return false;
   let any = false;
   for (const it of items){
@@ -773,30 +773,46 @@ function _kniParse(j, add){
       const id = it.id != null ? it.id : (it.kart_note_id != null ? it.kart_note_id : it.note_id);
       const kart = it.kart_id != null ? it.kart_id : (it.kart_garage_id != null ? it.kart_garage_id : it.rf_kart_id);
       let note = it.note != null ? it.note : (it.message != null ? it.message : (it.annotation != null ? it.annotation : it.description));
-      // object rows can also carry an HTML action column that holds the button ids/kart/text
-      const htmlBlob = [it.action, it.actions, it.options, it.buttons, it.tools].filter(Boolean).join(' ');
+      const htmlBlob = Object.values(it).filter((v) => typeof v === 'string' && /kart_note/.test(v)).join(' ');   // any cell holding the action buttons
       if (htmlBlob){ for (const b of parseKartNoteButtons(htmlBlob)) if (add(b.kartNoteId, kart != null ? kart : b.rfKartId, note != null ? note : b.note)) any = true; }
       if (id != null && add(id, kart, note)) any = true;
     } else if (Array.isArray(it)){
       const joined = it.map((c) => (c == null ? '' : String(c))).join(' ');
-      let textCell = '';   // longest non-numeric plain-text cell -> note fallback when the button lacks data-message
+      let textCell = '';
       for (const c of it){ const t = String(c == null ? '' : c).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim(); if (t.length > textCell.length && !/^\d+$/.test(t) && !/^\d{2}\.\d{2}\.\d{4}/.test(t)) textCell = t; }
       for (const b of parseKartNoteButtons(joined)) if (add(b.kartNoteId, b.rfKartId, b.note || textCell)) any = true;
     }
   }
   return any;
 }
+// Extract note (kart_note_id, rf_kart_id, text) from a RAW response — works whether it's JSON, an HTML
+// fragment, or JSON with escaped/unicode-escaped HTML. This is deliberately format-agnostic so a delete
+// can't fail just because kart-notes-table shapes its rows unexpectedly.
+function _kniExtractRaw(text, add){
+  if (!text) return false;
+  let any = false;
+  let j = null; try { j = JSON.parse(text); } catch (e) {}
+  if (j && _kniParse(j, add)) any = true;
+  const unesc = String(text).replace(/\\u003c/gi, '<').replace(/\\u003e/gi, '>').replace(/\\u0026/gi, '&').replace(/\\"/g, '"').replace(/\\\//g, '/');
+  try { for (const b of parseKartNoteButtons(unesc)) if (b.kartNoteId != null && add(b.kartNoteId, b.rfKartId, b.note)) any = true; } catch (e) {}
+  // Raw attribute scan as a final fallback (edit button carries id + kart + message; order-tolerant).
+  const grab = (re) => { let m; while ((m = re.exec(unesc))) { const id = Number(m[1]); const kart = m[2] != null ? Number(m[2]) : null; const msg = m[3] != null ? m[3] : null; if (add(id, kart, msg)) any = true; } };
+  grab(/data-id="(\d+)"[^>]{0,120}?data-kart-id="(\d+)"[^>]{0,200}?data-message="([^"]*)"/g);
+  if (!any) grab(/data-id="(\d+)"[^>]{0,120}?data-kart-id="(\d+)"()/g);
+  return any;
+}
 async function _kniFetch(url){
   const out = [], seen = new Set();
-  const add = (id, kart, note) => { const n = Number(id); if (!n || seen.has(n)) return false; seen.add(n); out.push({ kartNoteId: n, rfKartId: (kart != null && /^\d+$/.test(String(kart))) ? Number(kart) : null, note: note != null ? String(note) : null }); return true; };
-  _kniParse(await rfMaybeJson(url), add);
-  return out;
+  const add = (id, kart, note) => { const n = Number(id); if (!n || seen.has(n)) return false; seen.add(n); out.push({ kartNoteId: n, rfKartId: (kart != null && /^\d+$/.test(String(kart))) ? Number(kart) : null, note: note != null ? String(note).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() : null }); return true; };
+  let text = ''; try { text = await (await rf(url, { ajax: true })).text(); } catch (e) { return []; }
+  _kniExtractRaw(text, add);
+  return { data: out, sample: text.slice(0, 600) };
 }
 async function getKartNoteIndex({ probe = true } = {}){
   if (_kni.data.length && Date.now() - _kni.at < 4000) return _kni.data;
   if (typeof _kniUrl === 'string' && _kniUrl){                 // known-good endpoint -> just refetch it
-    const data = await _kniFetch(_kniUrl);
-    if (data.length){ _kni = { at: Date.now(), data }; return data; }
+    const r = await _kniFetch(_kniUrl);
+    if (r.data.length){ _kni = { at: Date.now(), data: r.data }; return r.data; }
     _kniUrl = undefined;                                       // stopped working -> allow a reprobe
   }
   if (!probe) return [];                                       // notes loop: never probe, only use a known endpoint
@@ -817,17 +833,16 @@ async function getKartNoteIndex({ probe = true } = {}){
     const norm = disc.map((u) => u.includes('page=') ? u : (u + (u.includes('?') ? '&' : '/?') + 'page=1&results=1000&search='));
     cands = [...new Set([...norm, ...cands])];
   } catch (e) {}
-  if (out.length){ _kniUrl = ''; _kni = { at: Date.now(), data: out }; return out; }   // page was client-rendered -> use its buttons; no ajax url to memo
+  if (out.length){ _kniUrl = ''; _kni = { at: Date.now(), data: out }; return out; }   // page was client-rendered
 
   let _probeSample = '';
   for (const url of cands){
-    const raw = await rfMaybeJson(url);
-    if (raw && !_probeSample) _probeSample = `${url} => ${JSON.stringify(raw).slice(0, 800)}`;
-    const data = await _kniFetch(url);
-    if (data.length){ _kniUrl = url; _kni = { at: Date.now(), data }; console.log(`[notes] kart-note index endpoint: ${url.split('?')[0]} (${data.length} notes)`); return data; }
+    const r = await _kniFetch(url);
+    if (r.sample && !_probeSample) _probeSample = `${url} => ${r.sample}`;
+    if (r.data.length){ _kniUrl = url; _kni = { at: Date.now(), data: r.data }; console.log(`[notes] kart-note index endpoint: ${url.split('?')[0]} (${r.data.length} notes)`); return r.data; }
   }
   _kniUrl = '';
-  if (!_kniDiag){ _kniDiag = true; try { await rfDebug('kart_notes_index_fail', 0, `no kart_note_id source. tried: ${cands.slice(0, 8).join('  ')} | probeSample: ${_probeSample.slice(0, 400)}`, _pageHtml); } catch (e) {} }
+  if (!_kniDiag){ _kniDiag = true; try { await rfDebug('kart_notes_index_fail', 0, `no kart_note_id source. tried: ${cands.slice(0, 8).join('  ')} | probeSample: ${_probeSample.slice(0, 500)}`, _pageHtml); } catch (e) {} }
   _kni = { at: Date.now(), data: [] };
   return [];
 }

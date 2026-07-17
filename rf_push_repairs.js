@@ -734,8 +734,18 @@ async function drainTable(table, submit, scrape){
       console.log(`[rf-push] ${table} #${row.id}${row.action ? ' ('+row.action+')' : ''} by ${row.user_name} (kart ${row.kart_name}) -> sent${nid}`);
     } catch (e){
       loggedIn = false;
-      await supa.from(table).update({ status:'error', error:String(e).slice(0,500) }).eq('id', row.id);
-      console.error(`[rf-push] ${table} #${row.id} failed:`, e.message || e);
+      const msg = String(e && e.message || e).slice(0, 480);
+      const hadRetry = /^\[retried\]/.test(String(row.error || ''));
+      const transient = /session expired|expired|login|fetch failed|network|ECONN|ETIMEDOUT|socket|HTTP 5\d\d/i.test(msg);
+      if (transient && !hadRetry){
+        // put it straight back in the queue with a retry marker — the next drain (seconds away, after a
+        // fresh login) re-sends it once. A second failure parks it as 'error' for inspection.
+        await supa.from(table).update({ status:'pending', error:'[retried] ' + msg }).eq('id', row.id);
+        console.error(`[rf-push] ${table} #${row.id} failed (transient — retrying once):`, msg);
+      } else {
+        await supa.from(table).update({ status:'error', error:msg }).eq('id', row.id);
+        console.error(`[rf-push] ${table} #${row.id} failed:`, msg);
+      }
     }
   }
 }
@@ -861,6 +871,32 @@ function startRepairPusher(scrape){
   // 3) safety net + keep the RaceFacer session warm
   setInterval(() => drainAll(scrape), SAFETY_POLL_MS);
   setInterval(keepWarm, 4 * 60 * 1000);
+  // 4) STARTUP RECOVERY — rows stuck in 'sending' are strandings from a worker that died/redeployed
+  // mid-push (every deploy restarts this process): they were claimed but never sent, and nothing ever
+  // re-selects 'sending', so the note/repair/status silently never reaches RaceFacer. After a short
+  // delay (lets a previous instance finish any genuinely in-flight row), flip them back to 'pending'.
+  // Also requeue rows that errored on clearly TRANSIENT failures (expired session / network), once.
+  setTimeout(async () => {
+    const tables = ['rf_repair_queue', 'rf_note_queue', 'rf_status_queue', 'rf_kart_edit_queue'];
+    for (const t of tables){
+      try {
+        const { data } = await supa.from(t).update({ status:'pending' }).eq('status','sending').is('sent_at', null).select('id');
+        if (data && data.length) console.log(`[rf-push] recovered ${data.length} stranded row(s) in ${t} (claimed by a dead instance) — re-sending`);
+      } catch (e) {}
+      try {
+        const { data: errs } = await supa.from(t).select('id,error').eq('status','error').limit(50);
+        for (const r of (errs || [])){
+          const msg = String(r.error || '');
+          if (/^\[retried\]/.test(msg)) continue;                                        // already had its retry
+          if (!/session expired|expired|login|fetch failed|network|ECONN|ETIMEDOUT|socket|HTTP 5\d\d/i.test(msg)) continue;
+          await supa.from(t).update({ status:'pending', error:'[retried] ' + msg.slice(0, 480) }).eq('id', r.id);
+          console.log(`[rf-push] requeued ${t} #${r.id} (transient error: ${msg.slice(0, 80)})`);
+        }
+      } catch (e) {}
+      // rows that already used their retry and failed again stay 'error' for inspection
+    }
+    drainAll(scrape);
+  }, 30000);
   syncWarehouse();
   setInterval(syncWarehouse, 6 * 60 * 60 * 1000);   // refresh the parts list every 6h
   syncKartRecords();
