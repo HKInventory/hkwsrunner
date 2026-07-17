@@ -12,7 +12,7 @@ const { fetch, Agent } = require('undici');
 const crypto = require('crypto');
 // Short stable hash of a repair row's content — a changed field (incl. mechanic) changes the hash.
 function contentHash(s){ return crypto.createHash('sha1').update(String(s)).digest('base64').slice(0, 20); }
-const { parseKartDetails, parseRepairs, parseParts, parseKartNotes, parseActiveNotes, parseGarageStatuses } = require('./racefacer-parse');
+const { parseKartDetails, parseRepairs, parseParts, parseKartNotes, parseActiveNotes, parseGarageStatuses, parseNotificationsList } = require('./racefacer-parse');
 const { reconcileDay } = require('./racefacer-reconcile');
 
 const RF_BASE = process.env.RF_BASE || 'https://103.166.146.163';
@@ -742,7 +742,61 @@ async function readKartNotes(id){
     return await syncKartNotes(id, SITE, activeFps);
   } catch (e){ console.error(`[notes-readback] kart ${id}: ${e.message}`); return 0; }
 }
-async function notesFast(garageFlags) {
+// AUTHORITATIVE, CHEAP "note added" detector. One fetch of the global notifications list (newest first)
+// tells us which karts just got a note — so we pull ONLY those karts' details instead of blind-rotating
+// ~190 karts to stumble on a new note (the thing that made adds take ~2.5min). Returns the number of
+// karts synced, or null if the list can't be read (caller falls back to the flag/rotate path). Cost:
+// one page fetch per cycle (inbound ≈ free; outbound is just the request), plus a detail fetch only for
+// karts that actually changed.
+let _notifHighWater = 0;      // epoch(ms) of the newest notification we've already acted on
+let _notifDiagDone = false;
+async function notesFromNotifications(){
+  let html;
+  try { const r = await rf('/en/administration/garage/notifications'); html = await r.text(); }
+  catch (e){ return null; }
+  if (/name=["']password["']|\/auth\/login/i.test(html || '')) throw new Error('session expired');
+  const rows = parseNotificationsList(html);
+  if (!rows.length){
+    // Table came back empty — likely a client-side (AJAX) DataTable, so the rows aren't in the page HTML.
+    // Dump the page ONCE so the real data source can be wired, then fall back to the flag/rotate path.
+    if (!_notifDiagDone){ _notifDiagDone = true; try { await rfDebug('notifications_page_html', 0, 'notifications page returned no parseable rows — wire the real (AJAX?) source from this', html); } catch (e) {} }
+    return null;
+  }
+  // kart NUMBER -> rf_id (+ type) from the fleet, to translate the list's "Kart" column into an rf id.
+  let byNum = new Map();
+  try {
+    const ks = (await sb('rf_karts?select=rf_id,name,type')) || [];
+    for (const k of ks){ if (k.name == null) continue; const key = String(k.name).trim(); if (!byNum.has(key)) byNum.set(key, []); byNum.get(key).push(k); }
+  } catch (e){ return null; }
+  if (!byNum.size) return null;
+
+  const toEpoch = (iso) => { const t = Date.parse(iso); return isNaN(t) ? 0 : t; };
+  const newest = rows.reduce((m, r) => Math.max(m, toEpoch(r.dateIso)), 0);
+  // First successful read establishes the high-water mark — we do NOT backfill history (the heavy sync
+  // and the 15-min sweep own the backlog); we only act on notes that appear AFTER the runner is watching.
+  if (!_notifHighWater){ _notifHighWater = newest; return 0; }
+
+  const freshKarts = new Set();
+  for (const r of rows){
+    if (toEpoch(r.dateIso) <= _notifHighWater) continue;
+    const cands = byNum.get(String(r.kartNumber || '').trim()) || [];
+    let pick = cands[0];
+    if (cands.length > 1 && r.kartType){
+      const want = r.kartType.toLowerCase().replace(/\s*track\s*/, '').trim();
+      pick = cands.find((c) => (c.type || '').toLowerCase().includes(want)) || cands[0];
+    }
+    if (pick && pick.rf_id != null) freshKarts.add(pick.rf_id);
+  }
+  _notifHighWater = Math.max(_notifHighWater, newest);
+  if (!freshKarts.size) return 0;
+
+  // Pull details for exactly those karts (bounded concurrency) — this syncs the new note + its ids.
+  const ids = [...freshKarts]; let touched = 0, idx = 0;
+  async function w(){ while (idx < ids.length){ const id = ids[idx++]; await readKartNotes(id); touched++; } }
+  await Promise.all(Array.from({ length: Math.min(6, ids.length) }, () => w()));
+  return touched;
+}
+async function notesFast(garageFlags, opts) {
   const site = SITE;   // lowercased module const (see line ~18) — never the raw env, or notes get written under 'SYDNEY' and the app's site='sydney' query can't see them
 
   // The fleet's kart ids (from rf_karts). This is what we rotate through.
@@ -784,13 +838,16 @@ async function notesFast(garageFlags) {
       }
     }
   } else {
-    // No note indicator on the list this cycle: re-check every DB-tracked kart (catches edits + clears)
-    // plus a rotating batch of the rest so a brand-new note on a clean kart is still found within a
-    // full rotation.
+    // No note indicator on the list this cycle: always re-check DB-tracked open notes (catches edits +
+    // clears + in-place resolves). Add a rotating batch to CATCH NEW notes too — but only when we don't
+    // already have an authoritative add-signal (the notifications-list path). opts.noRotate suppresses the
+    // rotation so we don't double-fetch and blow the bandwidth cap when the list is already telling us.
     for (const id of dbFlag) toCheck.add(id);
-    const BATCH = parseInt(process.env.NOTES_FAST_BATCH, 10) || 24;
-    for (let i = 0; i < BATCH && i < fleet.length; i++) toCheck.add(fleet[(_noteCursor + i) % fleet.length]);
-    _noteCursor = (_noteCursor + BATCH) % fleet.length;
+    if (!(opts && opts.noRotate)) {
+      const BATCH = parseInt(process.env.NOTES_FAST_BATCH, 10) || 24;
+      for (let i = 0; i < BATCH && i < fleet.length; i++) toCheck.add(fleet[(_noteCursor + i) % fleet.length]);
+      _noteCursor = (_noteCursor + BATCH) % fleet.length;
+    }
   }
 
   const ids = [...toCheck];
@@ -948,4 +1005,4 @@ async function main() {
 }
 
 if (require.main === module) main().catch((e) => { console.error(e); process.exit(1); });
-module.exports = { login, rfJson, enumerateKarts, syncKart, statusFast, reconcileToday, logTrackSegments, refreshLiveTracks, sweepNotesAll, notesFast, readKartNotes };
+module.exports = { login, rfJson, enumerateKarts, syncKart, statusFast, reconcileToday, logTrackSegments, refreshLiveTracks, sweepNotesAll, notesFast, notesFromNotifications, readKartNotes };

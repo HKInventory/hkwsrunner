@@ -219,4 +219,36 @@ function parseActiveNotes(detailsHtml) {
   return out;
 }
 
-module.exports = { parseKartDetails, parseRepairs, parseParts, parseKartNotes, parseActiveNotes, parseGarageStatuses, analysePartWear };
+// The GLOBAL notifications page (/en/administration/garage/notifications) — a fleet-wide list of every
+// note, newest first. ONE fetch of this tells us which karts got a NEW note, so we can pull just those
+// karts' details instead of blind-rotating the whole fleet. Best-effort/defensive parse: columns are
+// [checkbox, Date, Title, Kart, Kart type, Name]; we find the date by pattern, the kart number as the
+// bare-numeric cell, the kart type as the "… Track" cell, and the notification id off the row checkbox
+// (its value is what "Delete selected" posts). Returns [] if the table is empty (e.g. rendered via a
+// client-side AJAX source) so the caller can fall back and capture the real source.
+function parseNotificationsList(html) {
+  const $ = cheerio.load(html || '');
+  const out = [];
+  $('table tbody tr').each((_, tr) => {
+    const $tr = $(tr);
+    const rowText = txt($tr.text());
+    const dm = rowText.match(/(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2})/);
+    if (!dm) return;                                   // header / spacer / non-note row
+    const dateIso = `${dm[3]}-${dm[2]}-${dm[1]}T${dm[4]}:${dm[5]}:00`;
+    const rowHtml = $.html(tr) || '';
+    const notifId = Number(
+      (rowHtml.match(/<input[^>]*type=["']checkbox["'][^>]*value=["'](\d+)["']/i) || [])[1] ||
+      (rowHtml.match(/value=["'](\d+)["'][^>]*type=["']checkbox["']/i) || [])[1] ||
+      (rowHtml.match(/data-id=["'](\d+)["']/) || [])[1] || 0) || null;
+    let kartNumber = null, kartType = null;
+    $tr.children('td').each((__, td) => {
+      const t = txt($(td).text());
+      if (kartNumber == null && /^\d{1,3}$/.test(t)) kartNumber = t;
+      if (kartType == null && /track/i.test(t)) kartType = t;
+    });
+    out.push({ dateIso, kartNumber, kartType, notifId });
+  });
+  return out;
+}
+
+module.exports = { parseKartDetails, parseRepairs, parseParts, parseKartNotes, parseActiveNotes, parseGarageStatuses, parseNotificationsList, analysePartWear };

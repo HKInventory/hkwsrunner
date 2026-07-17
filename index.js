@@ -61,11 +61,18 @@ const sync = require('./racefacer-sync');
 // session cookie) around the clock, which is a sustained ~500MB/hr outbound drain independent of races.
 // Notes change a few times a day and the ~5min heavy pass also syncs them, so a long gap is plenty.
 // These are DEFAULTS ONLY — the same env vars still override for instant tuning without a redeploy.
-const STATUS_POLL = Math.max(2, parseInt(process.env.STATUS_POLL_SEC   || '5', 10)) * 1000;
+const STATUS_POLL = Math.max(2, parseInt(process.env.STATUS_POLL_SEC   || '3', 10)) * 1000;   // status = 5 cheap list pages -> poll tight; independent of notes now
 const NOTES_CONC  = Math.max(2, Math.min(12, parseInt(process.env.NOTES_CONCURRENCY || '8', 10)));
-// Safety-net FULL sweep every ~15min catches the rare change the targeted pass can't see (e.g. a note
-// edited in place, which keeps its list-flag). Expressed as "every N poll ticks". Env override in secs.
-const FULL_SWEEP_EVERY = Math.max(5, Math.round(Math.max(60, parseInt(process.env.NOTES_FULL_SWEEP_SEC || '900', 10)) * 1000 / STATUS_POLL));
+// Notes now run in their OWN loop, at a cadence that depends on whether we have a cheap change-signal:
+//   • list-flagged  -> a stable fleet costs ~0 detail fetches, so we can poll fast (a new note lands in ~1 interval)
+//   • rotating      -> NO signal, so every cycle blind-fetches a batch; keep this gentler to respect the ~105GB/mo
+//                      outbound cap (fast blind rotation across ~190 karts would blow it). This path is the reason
+//                      note-adds are slow; the real fix is a working signal (see notesFromNotifications).
+const NOTES_POLL        = Math.max(2, parseInt(process.env.NOTES_POLL_SEC        || '4',  10)) * 1000;
+const NOTES_POLL_ROTATE = Math.max(5, parseInt(process.env.NOTES_POLL_ROTATE_SEC || '20', 10)) * 1000;
+// Safety-net FULL sweep on a wall-clock timer (catches the rare change no targeted pass can see, e.g. a note
+// edited in place whose list-flag never changes).
+const NOTES_FULL_SWEEP_MS = Math.max(60, parseInt(process.env.NOTES_FULL_SWEEP_SEC || '900', 10)) * 1000;
 
 // ONE login shared by the status poller and the notes sweeper (same module = same cookie jar).
 // The promise-guard stops both loops logging in at the same moment; an auth error resets it so
@@ -75,38 +82,82 @@ function ensureLogin(){ if (!_loginP) _loginP = sync.login().then(() => { log('R
 function dropLogin(){ _loginP = null; }
 function sleep(ms){ return new Promise((r) => setTimeout(r, ms)); }
 
-// COMBINED status + notes poll — ONE loop, ONE list-page fetch per cycle:
-//   1. statusFast() — ~5 garage list pages; writes changed status; parses per-kart note-flags off the
-//      SAME pages (free).
-//   2. notesFast()  — using those flags, fetches a kart's detail page ONLY when its note state CHANGED
-//      this cycle (a new note appeared, or a tracked note was cleared). A stable fleet = ZERO detail
-//      fetches, which is what makes it cheap to poll this often.
-// Both in the same cycle => a note added in RaceFacer is seen and pulled within ONE interval (~5s),
-// with no lag between two separate loops. A full parallel sweep every ~15min is a cheap safety net for
-// the one case flags can't see: a note edited in place (its flag never changes).
-async function statusPoller(){
-  let fails = 0, ticks = 0;
+// STATUS loop — tight and independent. Just the ~5 garage list pages + write-changed status. This no
+// longer waits on notes, so a status flip in RaceFacer reaches the app in ~one STATUS_POLL (~3s) no
+// matter what the notes loop is doing. statusFast() also parses per-kart note-flags off the SAME pages
+// (free) and stashes them on statusFast._noteFlags for the notes loop to consume.
+async function statusLoop(){
+  let fails = 0;
   while (!stopping){
     const t0 = Date.now();
     try {
       await ensureLogin();
       const changed = await sync.statusFast();
       if (changed) log(`status: ${changed} kart(s) changed`);
-      try {
-        const touched = await sync.notesFast(sync.statusFast && sync.statusFast._noteFlags);
-        if (touched && (ticks % 40 === 0)) log(`notes: ${touched} kart(s) synced${sync.statusFast && sync.statusFast._sawFlags ? ' (list-flagged)' : ' (rotating)'}`);
-      } catch (e) { log(`notes error: ${e.message}`); if (/login|session|401|403/i.test(e.message || '')) dropLogin(); }
       if (typeof sync.refreshLiveTracks === 'function') { try { await sync.refreshLiveTracks(); } catch (e) {} }
-      if ((++ticks % FULL_SWEEP_EVERY) === 0) { try { await sync.sweepNotesAll({ concurrency: NOTES_CONC }); } catch (e) { log(`notes full-sweep skipped: ${e.message}`); if (/login|session|401|403/i.test(e.message || '')) dropLogin(); } }
       fails = 0;
     } catch (e){
       fails++;
       if (/login|session|401|403/i.test(e.message || '')) dropLogin();
-      if (fails <= 3 || fails % 10 === 0) log(`poll error (${fails}): ${e.message}`);
+      if (fails <= 3 || fails % 10 === 0) log(`status poll error (${fails}): ${e.message}`);
       if (fails > 3) await sleep(Math.min(30000, fails * 1000));   // back off if RaceFacer is unhappy
     }
-    const spent = Date.now() - t0;
-    await sleep(Math.max(0, STATUS_POLL - spent));
+    await sleep(Math.max(0, STATUS_POLL - (Date.now() - t0)));
+  }
+}
+
+// NOTES loop — independent of status. Each cycle:
+//   1. notesFromNotifications() — ONE fetch of the global notifications list -> detects notes ADDED in
+//      RaceFacer fleet-wide and pulls only those karts' details. Authoritative + cheap (1 request), so a
+//      new note lands in ~one interval WITHOUT blind rotation. Returns null if it can't read the list
+//      (then we fall back to the flag/rotate path, and it self-logs the page once so we can wire it exactly).
+//   2. notesFast(flags) — flag-diff for adds/clears when the list exposes note-flags; otherwise a gentle
+//      rotating fallback. Also re-checks DB-open notes so an in-place resolve clears fast.
+// Cadence adapts: fast when we have a cheap signal (notifications list or list-flags), gentle when we're
+// blind-rotating, so we never breach the outbound bandwidth cap chasing notes.
+let _lastNotesMode = null, _lastSweepAt = Date.now();
+async function notesLoop(){
+  let fails = 0, ticks = 0;
+  await sleep(1500);   // let statusLoop populate note-flags on its first pass
+  while (!stopping){
+    const t0 = Date.now();
+    let haveSignal = false;
+    try {
+      await ensureLogin();
+      // 1) authoritative fleet-wide "note added" detector (one cheap request)
+      let viaList = null;
+      if (typeof sync.notesFromNotifications === 'function') {
+        try { viaList = await sync.notesFromNotifications(); } catch (e) { viaList = null; log(`notes-list error: ${e.message}`); if (/login|session|401|403/i.test(e.message || '')) dropLogin(); }
+      }
+      // 2) flag-diff / rotating fallback (also catches clears + in-place resolves). Suppress the blind
+      //    rotation when the notifications list already handled adds this cycle (no double-fetch).
+      let touched = 0;
+      try { touched = await sync.notesFast(sync.statusFast && sync.statusFast._noteFlags, { noRotate: viaList != null }); }
+      catch (e) { log(`notes error: ${e.message}`); if (/login|session|401|403/i.test(e.message || '')) dropLogin(); }
+
+      const flagged = !!(sync.statusFast && sync.statusFast._sawFlags);
+      haveSignal = (viaList != null) || flagged;
+      const mode = viaList != null ? 'notifications-list' : (flagged ? 'list-flagged' : 'rotating');
+      if (mode !== _lastNotesMode) { _lastNotesMode = mode; log(`notes detection mode: ${mode}`); }
+      ticks++;
+      if (viaList) log(`notes: ${viaList} new note(s) pulled (notifications-list)`);
+      else if (touched && (ticks % 15 === 0)) log(`notes: ${touched} kart(s) re-synced (${mode})`);
+
+      // wall-clock safety-net full sweep
+      if (Date.now() - _lastSweepAt >= NOTES_FULL_SWEEP_MS) {
+        _lastSweepAt = Date.now();
+        try { await sync.sweepNotesAll({ concurrency: NOTES_CONC }); }
+        catch (e) { log(`notes full-sweep skipped: ${e.message}`); if (/login|session|401|403/i.test(e.message || '')) dropLogin(); }
+      }
+      fails = 0;
+    } catch (e){
+      fails++;
+      if (/login|session|401|403/i.test(e.message || '')) dropLogin();
+      if (fails <= 3 || fails % 10 === 0) log(`notes poll error (${fails}): ${e.message}`);
+      if (fails > 3) await sleep(Math.min(30000, fails * 1000));
+    }
+    const interval = haveSignal ? NOTES_POLL : NOTES_POLL_ROTATE;
+    await sleep(Math.max(0, interval - (Date.now() - t0)));
   }
 }
 
@@ -143,7 +194,7 @@ function loop(tag, gapMs, extraEnv){
   return { start(delay){ timer = setTimeout(run, delay || 0); }, stop(){ clearTimeout(timer); } };
 }
 
-log(`combined worker up · site=${SITE} · pusher live · status+notes ~${STATUS_POLL / 1000}s (diff-only) · full-sync ~${HEAVY_GAP / 1000}s`);
+log(`combined worker up · site=${SITE} · pusher live · status ~${STATUS_POLL / 1000}s · notes ~${NOTES_POLL / 1000}s (flagged) / ~${NOTES_POLL_ROTATE / 1000}s (rotating) · full-sync ~${HEAVY_GAP / 1000}s`);
 
 // SESSIONS: poll RaceFacer session-management on the SAME shared login, so the app + HK AI
 // know which karts are in which session (and their time windows). Write-on-change; prunes to 7 days.
@@ -168,8 +219,10 @@ async function sessionsPoller(){
   }
 }
 
-// Status + notes: persistent in-process loops sharing ONE RaceFacer session.
-statusPoller().catch((e) => log(`status+notes poller crashed: ${e.message}`));
+// Status + notes: independent in-process loops sharing ONE RaceFacer session. Status polls tight (~3s)
+// so a status flip reaches the app fast regardless of what notes are doing; notes run on their own cadence.
+statusLoop().catch((e) => log(`status poller crashed: ${e.message}`));
+notesLoop().catch((e) => log(`notes poller crashed: ${e.message}`));
 sessionsPoller().catch((e) => log(`sessions poller crashed: ${e.message}`));
 
 // Heavy: full reconcile (repairs, parts, prune, reconcile) in its own spawned process.
