@@ -38,7 +38,11 @@ const path = require('path');
 
 // ---- 1. start the app -> RaceFacer pusher (persistent, realtime-driven) ----
 const { startRepairPusher } = require('./rf_push_repairs');
-startRepairPusher(/* scrapeKartRepairs */);   // optional: pass a per-kart re-scrape fn if you have one
+// scrape = post-push read-back. After the pusher creates/clears a note in RaceFacer we immediately
+// read THAT kart's notes back into Supabase, so the real note (with its RF id) lands within a second
+// or two and the app's "syncing…" clears at once — no waiting on a sweep, no dupes. readKartNotes
+// never throws, so a read-back hiccup can't mark a successful push as failed.
+startRepairPusher((kartId) => require('./racefacer-sync').readKartNotes(kartId));
 
 // ---- 1b. RiMO Germany WFM poller (live online / SOC / BMS per kart) --------
 try { require('./rimo').startRimo(); } catch (e) { console.error('[rimo] failed to start:', e.message || e); }
@@ -61,7 +65,7 @@ const STATUS_POLL = Math.max(2, parseInt(process.env.STATUS_POLL_SEC   || '8', 1
 const NOTES_CONC  = Math.max(2, Math.min(12, parseInt(process.env.NOTES_CONCURRENCY || '8', 10)));
 // FAST notes pass cadence: fetch detail pages ONLY for karts with note activity this cycle (see
 // notesSweeper). Cheap, so it can run often — a new/cleared note lands in ~one cycle.
-const NOTES_FAST  = Math.max(5, parseInt(process.env.NOTES_FAST_SEC || '12', 10)) * 1000;
+const NOTES_FAST  = Math.max(5, parseInt(process.env.NOTES_FAST_SEC || '8', 10)) * 1000;
 // Safety-net FULL sweep every ~15min catches the rare change the targeted pass can't see. Expressed
 // as "every N fast ticks" so it scales with NOTES_FAST. Env override in seconds.
 const FULL_SWEEP_EVERY = Math.max(5, Math.round(Math.max(60, parseInt(process.env.NOTES_FULL_SWEEP_SEC || '900', 10)) * 1000 / NOTES_FAST));

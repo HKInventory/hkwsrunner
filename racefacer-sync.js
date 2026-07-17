@@ -726,6 +726,17 @@ async function pruneStale(activeIds) {
 // Rotating cursor so successive fast cycles cover different karts, sweeping the whole fleet
 // every ~30s without fetching all 211 every cycle.
 let _noteCursor = 0;
+// Read ONE kart's notes back from RaceFacer into rf_kart_notes (kart-details for the active-note
+// flags, then the kart-notes table). NEVER throws — the pusher calls this straight after creating a
+// note in RaceFacer so the real note (with its RF id) lands in Supabase within a second or two and the
+// app's "syncing…" clears at once, without waiting for a sweep. A throw here must not fail the push.
+async function readKartNotes(id){
+  try {
+    const dj = await rfJson(`/ajax/garage/kart-details?id=${id}`);
+    const activeFps = activeNoteMap(id, (dj && dj.html) || '');
+    return await syncKartNotes(id, SITE, activeFps);
+  } catch (e){ console.error(`[notes-readback] kart ${id}: ${e.message}`); return 0; }
+}
 async function notesFast(garageFlags) {
   const site = SITE;   // lowercased module const (see line ~18) — never the raw env, or notes get written under 'SYDNEY' and the app's site='sydney' query can't see them
 
@@ -763,12 +774,8 @@ async function notesFast(garageFlags) {
   const ids = [...toCheck];
   let touched = 0;
   for (const id of ids) {
-    try {
-      const dj = await rfJson(`/ajax/garage/kart-details?id=${id}`);
-      const activeFps = activeNoteMap(id, (dj && dj.html) || '');
-      await syncKartNotes(id, site, activeFps);
-      touched++;
-    } catch (e) { /* one kart failing this cycle is fine; the sweep comes back around */ }
+    await readKartNotes(id);   // never throws; syncs this kart's notes back
+    touched++;
     await sleep(80);
   }
   return touched;
@@ -919,4 +926,4 @@ async function main() {
 }
 
 if (require.main === module) main().catch((e) => { console.error(e); process.exit(1); });
-module.exports = { login, rfJson, enumerateKarts, syncKart, statusFast, reconcileToday, logTrackSegments, refreshLiveTracks, sweepNotesAll, notesFast };
+module.exports = { login, rfJson, enumerateKarts, syncKart, statusFast, reconcileToday, logTrackSegments, refreshLiveTracks, sweepNotesAll, notesFast, readKartNotes };
