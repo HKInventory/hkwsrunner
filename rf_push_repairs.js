@@ -18,6 +18,7 @@
    ============================================================================ */
 const https = require('https');
 const { createClient } = require('@supabase/supabase-js');
+const { parseActiveNotes, parseKartNotes } = require('./racefacer-parse');
 const agent = new https.Agent({ rejectUnauthorized: false }); // self-signed cert on that IP
 
 const RF_BASE = (process.env.RF_BASE || 'https://103.166.146.163').replace(/\/$/, '');
@@ -346,6 +347,17 @@ async function rfNoteAction(row){
   return rfCreateNote(row);
 }
 
+// Fetch a RaceFacer ajax endpoint as JSON, using the pusher's own warm session.
+async function rfAjaxJson(path){
+  const r = await fetch(`${RF_BASE}${path}`, { agent, redirect:'manual',
+    headers: rfHeaders({ 'X-Requested-With':'XMLHttpRequest', Accept:'application/json, text/javascript, */*; q=0.01' }) });
+  absorb(r);
+  if (r.status===401 || /login/i.test(r.headers.get('location')||'')) { loggedIn=false; throw new Error('session expired'); }
+  const t = await r.text();
+  try { return JSON.parse(t); } catch { return { html: t }; }   // some endpoints answer with a bare HTML fragment
+}
+const _normNote = (s) => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+
 // Clear a note on RaceFacer — same as the app's X. A note lives in TWO places on RaceFacer and each has
 // its own delete call keyed on a DIFFERENT id, so one X must fire BOTH or the note half-survives and the
 // runner's read-back resurrects it:
@@ -380,8 +392,33 @@ async function rfDeleteNote(row){
   // successful clear is confirmed to the app immediately (prunes the note) rather than waiting on a sweep.
   if (kartId != null) row.rf_kart_id = kartId;
 
+  // LAST-RESORT LIVE RESOLUTION: if the sync never captured the ids (parser miss on the per-kart pages),
+  // read them straight off RaceFacer now. The note is still live on RF (that's what we're clearing), so
+  // it appears on the kart-details active list (-> notification_id) and the kart-notes list (-> kart_note_id).
+  // Match by the note text the app sent. If we STILL can't read an id, dump the HTML so the parser can be
+  // pinned exactly. This makes the delete work even when the stored ids are null.
+  if (kartId != null && ((nid == null || nid === '') || knid == null)) {
+    const want = _normNote(row.note);
+    try {
+      if (nid == null || nid === '') {
+        const dj = await rfAjaxJson(`/ajax/garage/kart-details?id=${kartId}`);
+        const active = parseActiveNotes((dj && dj.html) || '');
+        const m = active.find((a) => _normNote(a.note) === want) || (want ? active.find((a) => _normNote(a.note).includes(want.slice(0, 40))) : null);
+        if (m && m.notifId != null) nid = m.notifId;
+        else if (!active.length || !active.some((a) => a.notifId != null)) { try { await rfDebug('note_delete_html', kartId, `kart-details active-notes: could not read notification_id (note "${String(row.note||'').slice(0,60)}")`, (dj && dj.html) || ''); } catch (e) {} }
+      }
+      if (knid == null) {
+        const nj = await rfAjaxJson(`/ajax/garage/kart-notes?id=${kartId}`);
+        const notes = parseKartNotes(nj || {});
+        const m = notes.find((n) => _normNote(n.note) === want) || (want ? notes.find((n) => _normNote(n.note).includes(want.slice(0, 40))) : null);
+        if (m && m.kartNoteId != null) knid = m.kartNoteId;
+        else if (!notes.length || !notes.some((n) => n.kartNoteId != null)) { try { await rfDebug('note_delete_html', kartId, `kart-notes: could not read kart_note_id (note "${String(row.note||'').slice(0,60)}")`, (nj && nj.html) || JSON.stringify(nj || '')); } catch (e) {} }
+      }
+    } catch (e) { console.log(`[rf-push] note delete #${row.id}: live id lookup failed: ${e.message}`); }
+  }
+
   if ((nid == null || nid === '') && (knid == null || knid === '')) {
-    console.log(`[rf-push] note delete #${row.id}: no notification_id or kart_note_id resolvable — nothing to clear on RaceFacer (has the rf_note_queue_action.sql migration been run?)`); return;
+    console.log(`[rf-push] note delete #${row.id}: no notification_id or kart_note_id resolvable — nothing to clear on RaceFacer (check rf_debug 'note_delete_html')`); return;
   }
 
   // Auth is just the session cookie + the XSRF-TOKEN cookie echoed as X-XSRF-TOKEN (exactly what the
