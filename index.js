@@ -52,9 +52,19 @@ try { require('./hkai').startAI(); } catch (e) { console.error('[ai] failed to s
 // in-process: log in ONCE, then hit the ~5 garage list pages on a tight loop and write only the
 // karts whose status flipped. ~5 requests/cycle is well within what RaceFacer tolerates.
 const sync = require('./racefacer-sync');
-const STATUS_POLL = Math.max(2, parseInt(process.env.STATUS_POLL_SEC   || '2', 10)) * 1000;
-const NOTES_CONC  = Math.max(2, Math.min(12, parseInt(process.env.NOTES_CONCURRENCY || '10', 10)));
-const NOTES_PAUSE = Math.max(1, parseInt(process.env.NOTES_GAP_SEC     || '1', 10)) * 1000;
+// BANDWIDTH: the notes sweep re-fetches EVERY kart's detail page each pass. With a 1s pause it ran a
+// full ~200-kart sweep roughly every 8s, 24/7 — ~25 RaceFacer requests/sec (each carrying the big
+// session cookie) around the clock, which is a sustained ~500MB/hr outbound drain independent of races.
+// Notes change a few times a day and the ~5min heavy pass also syncs them, so a long gap is plenty.
+// These are DEFAULTS ONLY — the same env vars still override for instant tuning without a redeploy.
+const STATUS_POLL = Math.max(2, parseInt(process.env.STATUS_POLL_SEC   || '8', 10)) * 1000;
+const NOTES_CONC  = Math.max(2, Math.min(12, parseInt(process.env.NOTES_CONCURRENCY || '8', 10)));
+// FAST notes pass cadence: fetch detail pages ONLY for karts with note activity this cycle (see
+// notesSweeper). Cheap, so it can run often — a new/cleared note lands in ~one cycle.
+const NOTES_FAST  = Math.max(5, parseInt(process.env.NOTES_FAST_SEC || '12', 10)) * 1000;
+// Safety-net FULL sweep every ~15min catches the rare change the targeted pass can't see. Expressed
+// as "every N fast ticks" so it scales with NOTES_FAST. Env override in seconds.
+const FULL_SWEEP_EVERY = Math.max(5, Math.round(Math.max(60, parseInt(process.env.NOTES_FULL_SWEEP_SEC || '900', 10)) * 1000 / NOTES_FAST));
 
 // ONE login shared by the status poller and the notes sweeper (same module = same cookie jar).
 // The promise-guard stops both loops logging in at the same moment; an auth error resets it so
@@ -86,28 +96,37 @@ async function statusPoller(){
   }
 }
 
-// NOTES: parallel full-fleet sweep (~6-8s for 211 karts at concurrency 8) on the SAME session —
-// no per-cycle login. A note added/edited/deleted in RaceFacer lands in the app within one
-// sweep + pause, i.e. well under 10s. syncKartNotes writes only on change, so realtime cost of a
-// quiet sweep is zero.
+// NOTES (fast + targeted): on every tick, notesFast() fetches detail pages ONLY for karts with note
+// activity this cycle — every kart the DB thinks has an open note (so an EDIT or the LAST note being
+// cleared syncs at once, and a note cleared in RaceFacer is pruned) PLUS any kart the garage LIST page
+// (parsed for free by the status poller) newly flags as having a note. When the list exposes note-flags
+// a quiet fleet costs ~zero requests and a new note lands in ~one tick (~12s); when it doesn't, notesFast
+// rotates a small batch so brand-new notes are still caught. A FULL parallel sweep every ~15min is a
+// cheap safety net for the rare change neither path sees. syncKartNotes writes only on change, so a
+// quiet cycle costs zero realtime messages.
 async function notesSweeper(){
-  let fails = 0, sweeps = 0;
-  await sleep(4000);                              // let the status poller establish the session first
+  let fails = 0, ticks = 0;
+  await sleep(4000);                              // let the status poller establish the session + first flags
   while (!stopping){
     const t0 = Date.now();
     try {
       await ensureLogin();
-      await sync.sweepNotesAll({ concurrency: NOTES_CONC });
-      fails = 0; sweeps++;
-      const secs = (Date.now() - t0) / 1000;
-      if (sweeps % 50 === 1 || secs > 12) log(`notes sweep #${sweeps}: ${secs.toFixed(1)}s (concurrency ${NOTES_CONC})`);
+      const flags = sync.statusFast && sync.statusFast._noteFlags;   // note-flags from the latest status pass (free)
+      const touched = await sync.notesFast(flags);
+      if ((++ticks % FULL_SWEEP_EVERY) === 0) {
+        try { await sync.sweepNotesAll({ concurrency: NOTES_CONC }); }
+        catch (e) { log(`notes full-sweep skipped: ${e.message}`); if (/login|session|401|403/i.test(e.message || '')) dropLogin(); }
+      }
+      fails = 0;
+      if (touched && (ticks % 25 === 1)) log(`notes fast: ${touched} kart(s) checked${sync.statusFast && sync.statusFast._sawFlags ? ' (list-flagged)' : ' (rotating)'}`);
     } catch (e){
       fails++;
       if (/login|session|401|403/i.test(e.message || '')) dropLogin();
-      log(`notes sweep error (${fails}): ${e.message}`);
+      log(`notes fast error (${fails}): ${e.message}`);
       await sleep(Math.min(30000, 2000 * fails)); // RaceFacer struggling -> ease off, then resume
     }
-    await sleep(NOTES_PAUSE);
+    const spent = Date.now() - t0;
+    await sleep(Math.max(0, NOTES_FAST - spent));
   }
 }
 

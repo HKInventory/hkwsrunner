@@ -155,7 +155,22 @@ function parseGarageStatuses(html) {
     else if (/mainten|service|repair/.test(title) || /\b(yellow|orange|amber|warning)\b/.test(cls)) statusCode = 3; // FOR MAINTENANCE
     else if (/\bok\b|good|working|available|fine|operational|ready|active/.test(title) || /\bgreen\b/.test(cls)) statusCode = 1; // OK
     const status = statusCode === 2 ? 'DAMAGED' : statusCode === 3 ? 'FOR MAINTENANCE' : statusCode === 1 ? 'OK' : null;
-    if (rfId) out.push({ rfId, name, statusCode, status });
+    // NOTE INDICATOR: RaceFacer marks a kart card when it has an open note (a note/notification/star
+    // icon or a count badge). We read that flag off this cheap list page so the fast notes pass can
+    // fetch a kart's detail page ONLY when its note-flag flips — instead of sweeping the whole fleet.
+    // Match broadly: a false positive just costs one harmless extra fetch; a miss falls back to the
+    // rotating sweep, so this can only ever help. (If your list markup differs, send one kart card's
+    // HTML and this pattern gets pinned exactly.)
+    let hasNote = false;
+    $el.find('i,span,a,button').each((__, n) => {
+      const c = ($(n).attr('class') || '').toLowerCase();
+      const t = ($(n).attr('title') || '').toLowerCase();
+      const dt = ($(n).attr('data-original-title') || '').toLowerCase();   // Bootstrap tooltip title
+      if (/sticky[-_ ]?note|fa-note|note-icon|has[-_ ]?note|notif|comment/.test(c) ||
+          /\bnote\b|\bnotes\b|notification/.test(t + ' ' + dt)) hasNote = true;
+    });
+    if (!hasNote && /data-(?:has[-_]?notes?|note[-_]?count|notes?)=["']?[1-9]/.test(outer.toLowerCase())) hasNote = true;
+    if (rfId) out.push({ rfId, name, statusCode, status, hasNote });
   });
   return out;
 }

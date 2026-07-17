@@ -741,17 +741,24 @@ async function notesFast(garageFlags) {
   try { dbActive = (await sb('rf_kart_notes?active=eq.true&select=rf_kart_id')) || []; } catch (e) {}
   const dbFlag = new Set(dbActive.map((r) => r.rf_kart_id).filter((x) => x != null));
 
-  // Per-cycle set: everything currently flagged in the DB, PLUS a rotating slice of the rest of
-  // the fleet so brand-new notes on a previously-clean kart are picked up within a full rotation.
-  // parseGarageStatuses does NOT expose a note indicator, so we can't tell which clean kart just
-  // got a note — hence the rotating sweep rather than a targeted check.
-  const BATCH = parseInt(process.env.NOTES_FAST_BATCH, 10) || 40;   // karts swept per cycle
+  // Always re-check karts the DB believes have an open note: that's where an EDIT or the LAST note
+  // being cleared shows up, and it also catches a note cleared in RaceFacer (the list flag drops but
+  // the DB row lingers until we re-fetch and prune it).
   const toCheck = new Set(dbFlag);
+  // A kart the LIST page flags as having a note but the DB does NOT = a brand-new note. Fetch it now.
   if (garageFlags && garageFlags.size) for (const id of garageFlags) if (!dbFlag.has(id)) toCheck.add(id);
-  for (let i = 0; i < BATCH && i < fleet.length; i++) {
-    toCheck.add(fleet[(_noteCursor + i) % fleet.length]);
+
+  // If the list page actually exposed note-flags this cycle, they're authoritative — every kart with
+  // note activity (new, edited, or cleared) is already in toCheck, so we fetch ONLY those. A quiet
+  // fleet costs ~zero requests and a new note lands within one cycle (~10s). If the parser found NO
+  // flags (the list markup carries no note indicator), fall back to a rotating sweep so brand-new
+  // notes on a clean kart are still caught within a full rotation.
+  const sawFlags = !!(statusFast && statusFast._sawFlags);
+  if (!sawFlags) {
+    const BATCH = parseInt(process.env.NOTES_FAST_BATCH, 10) || 24;   // karts swept per blind cycle
+    for (let i = 0; i < BATCH && i < fleet.length; i++) toCheck.add(fleet[(_noteCursor + i) % fleet.length]);
+    _noteCursor = (_noteCursor + BATCH) % fleet.length;   // advance for next cycle
   }
-  _noteCursor = (_noteCursor + BATCH) % fleet.length;   // advance for next cycle
 
   const ids = [...toCheck];
   let touched = 0;
@@ -912,4 +919,4 @@ async function main() {
 }
 
 if (require.main === module) main().catch((e) => { console.error(e); process.exit(1); });
-module.exports = { login, rfJson, enumerateKarts, syncKart, statusFast, reconcileToday, logTrackSegments, refreshLiveTracks, sweepNotesAll };
+module.exports = { login, rfJson, enumerateKarts, syncKart, statusFast, reconcileToday, logTrackSegments, refreshLiveTracks, sweepNotesAll, notesFast };
