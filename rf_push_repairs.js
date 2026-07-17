@@ -355,60 +355,71 @@ async function rfNoteAction(row){
 // (the data-id on the Kart Notes row's edit/delete button, captured by parseKartNotes). The app only sends
 // the notification_id, so we resolve the kart_note_id from the stored note row here.
 async function rfDeleteNote(row){
-  const nid = row.rf_notification_id != null ? row.rf_notification_id : row.notification_id;
-  // kart_note_id: prefer one carried on the queue row (future-proofing), else look it up from the note the
-  // sync stored. The app marks the note inactive rather than deleting it, so the row (with its ids) is still
-  // there. Match on kart + notification_id when we have it, else fall back to kart + note text.
-  let knid = row.rf_kart_note_id != null ? row.rf_kart_note_id : null;
-  if (knid == null) {
+  // Resolve everything we need from the stored note. The app's X marks the note inactive (it doesn't
+  // delete the row), so rf_kart_id / rf_notification_id / rf_kart_note_id are all still on it — and the
+  // app doesn't always send rf_kart_id (some X buttons pass null), so we MUST be able to fill it in here
+  // or the clear silently no-ops. Match on notification_id when the queue row carries it, else on note text.
+  let nid    = row.rf_notification_id != null ? row.rf_notification_id : (row.notification_id != null ? row.notification_id : null);
+  let knid   = row.rf_kart_note_id != null ? row.rf_kart_note_id : null;
+  let kartId = row.rf_kart_id != null ? row.rf_kart_id : null;
+  if (nid == null || knid == null || kartId == null) {
     try {
-      let q = supa.from('rf_kart_notes').select('rf_kart_note_id').eq('rf_kart_id', row.rf_kart_id);
+      let q = supa.from('rf_kart_notes').select('rf_kart_id,rf_notification_id,rf_kart_note_id');
       if (nid != null && nid !== '') q = q.eq('rf_notification_id', nid);
-      else if (row.note) q = q.eq('note', row.note);
+      else if (row.note) { q = q.eq('note', row.note); if (kartId != null) q = q.eq('rf_kart_id', kartId); }
+      else if (kartId != null) q = q.eq('rf_kart_id', kartId);
       const { data } = await q.order('created_at', { ascending:false }).limit(1);
-      if (data && data[0] && data[0].rf_kart_note_id != null) knid = data[0].rf_kart_note_id;
-    } catch (e) { /* column may not be migrated yet, or lookup miss — degrade to notification-only */ }
+      if (data && data[0]) {
+        if (kartId == null && data[0].rf_kart_id != null) kartId = data[0].rf_kart_id;
+        if ((nid == null || nid === '') && data[0].rf_notification_id != null) nid = data[0].rf_notification_id;
+        if (knid == null && data[0].rf_kart_note_id != null) knid = data[0].rf_kart_note_id;
+      }
+    } catch (e) { /* columns may not be migrated yet, or lookup miss — degrade to whatever we have */ }
   }
+  // The read-back after this push (drainTable's scrape hook) uses row.rf_kart_id — make sure it's set so a
+  // successful clear is confirmed to the app immediately (prunes the note) rather than waiting on a sweep.
+  if (kartId != null) row.rf_kart_id = kartId;
+
   if ((nid == null || nid === '') && (knid == null || knid === '')) {
-    console.log(`[rf-push] note delete #${row.id}: no notification_id or kart_note_id — nothing to clear on RaceFacer`); return;
+    console.log(`[rf-push] note delete #${row.id}: no notification_id or kart_note_id resolvable — nothing to clear on RaceFacer (has the rf_note_queue_action.sql migration been run?)`); return;
   }
 
-  const ctx = await formContext(row.rf_kart_id);            // refreshes cookies + gives a CSRF token
-  const xsrf = decodeURIComponent(jar['XSRF-TOKEN'] || ''); // Laravel's cookie CSRF, echoed back as a header
+  // Auth is just the session cookie + the XSRF-TOKEN cookie echoed as X-XSRF-TOKEN (exactly what the
+  // captured browser calls used). No kart-specific form token is needed — the previous code fetched one
+  // via formContext(kart_id) and BROKE whenever the app sent a null kart_id. Warm the session if needed.
+  if (!jar['XSRF-TOKEN']) { try { await rfLogin(); } catch (e) {} }
+  const xsrf = decodeURIComponent(jar['XSRF-TOKEN'] || '');
   let cleared = 0; const fails = [];
 
   // 1) Notifications — captured: JSON body {"ids":[<notification_id>]}, auth via X-XSRF-TOKEN.
   if (nid != null && nid !== '') {
     const r = await fetch(`${RF_BASE}/ajax/garage/notifications/delete`, { method:'POST', agent, redirect:'manual',
       headers: rfHeaders({ 'Content-Type':'application/json', Accept:'application/json, text/plain, */*',
-        'X-XSRF-TOKEN': xsrf, 'X-CSRF-Token': ctx.token,
-        Referer:`${RF_BASE}/en/administration/garage/notifications` }),
+        'X-XSRF-TOKEN': xsrf, Referer:`${RF_BASE}/en/administration/garage/notifications` }),
       body: JSON.stringify({ ids:[Number(nid)] }) });
     absorb(r);
     if (r.status===401 || /login/i.test(r.headers.get('location')||'')) { loggedIn=false; throw new Error('session expired'); }
     const { txt, j } = await rfBody(r);
     const fail = rfFailure(r.status, txt, j);
-    if (fail){ await rfDebug('note_delete', row.rf_kart_id, `notifications/delete refused for notif ${nid}: ${fail}`, txt); fails.push(`notifications:${fail}`); }
-    else { cleared++; console.log(`[rf-push] notification ${nid} cleared on RaceFacer (kart ${row.rf_kart_id})`); }
+    if (fail){ await rfDebug('note_delete', kartId, `notifications/delete refused for notif ${nid}: ${fail}`, txt); fails.push(`notifications:${fail}`); }
+    else { cleared++; console.log(`[rf-push] notification ${nid} cleared on RaceFacer (kart ${kartId})`); }
   }
 
-  // 2) Kart Notes — captured: form body kart_note_id=<id>. We add the CSRF token belt-and-braces (the
-  //    captured request carried none, so the route is CSRF-exempt; a valid token can only help, never hurt).
+  // 2) Kart Notes — captured: form body kart_note_id=<id> (no token). X-XSRF-TOKEN sent harmlessly.
   if (knid != null && knid !== '') {
-    const body = new URLSearchParams({ kart_note_id:String(knid), _token: ctx.token }).toString();
+    const body = new URLSearchParams({ kart_note_id:String(knid) }).toString();
     const r = await fetch(`${RF_BASE}/ajax/garage/notes/delete`, { method:'POST', agent, redirect:'manual',
       headers: rfHeaders({ 'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8', Accept:'*/*',
-        'X-XSRF-TOKEN': xsrf, 'X-CSRF-Token': ctx.token,
-        Referer:`${RF_BASE}/en/administration/garage/kart-notes` }),
+        'X-XSRF-TOKEN': xsrf, Referer:`${RF_BASE}/en/administration/garage/kart-notes` }),
       body });
     absorb(r);
     if (r.status===401 || /login/i.test(r.headers.get('location')||'')) { loggedIn=false; throw new Error('session expired'); }
     const { txt, j } = await rfBody(r);
     const fail = rfFailure(r.status, txt, j);
-    if (fail){ await rfDebug('note_delete', row.rf_kart_id, `notes/delete refused for kart_note ${knid}: ${fail}`, txt); fails.push(`notes:${fail}`); }
-    else { cleared++; console.log(`[rf-push] kart note ${knid} cleared on RaceFacer (kart ${row.rf_kart_id})`); }
+    if (fail){ await rfDebug('note_delete', kartId, `notes/delete refused for kart_note ${knid}: ${fail}`, txt); fails.push(`notes:${fail}`); }
+    else { cleared++; console.log(`[rf-push] kart note ${knid} cleared on RaceFacer (kart ${kartId})`); }
   } else {
-    console.log(`[rf-push] note delete #${row.id}: no kart_note_id found — Kart Notes row NOT cleared (run rf_note_queue_action.sql + let one sync populate rf_kart_note_id)`);
+    console.log(`[rf-push] note delete #${row.id}: no kart_note_id resolved — Kart Notes row NOT cleared (run rf_note_queue_action.sql + let one sync populate rf_kart_note_id)`);
   }
 
   // Retry (throw) only if NOTHING cleared — a partial success must not loop the row forever.
