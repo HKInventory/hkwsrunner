@@ -785,14 +785,24 @@ function _kniParse(j, add){
   }
   return any;
 }
-// Extract note (kart_note_id, rf_kart_id, text) from a RAW response — works whether it's JSON, an HTML
-// fragment, or JSON with escaped/unicode-escaped HTML. This is deliberately format-agnostic so a delete
-// can't fail just because kart-notes-table shapes its rows unexpectedly.
+// Extract note (kart_note_id, rf_kart_id, text) from a RAW response. CONFIRMED SHAPE (from the live
+// Render log): kart-notes-table answers {"error":false,"success":true,"html":"<div...><table ...rows..."}
+// — the note rows (with the edit/delete anchors carrying data-id / data-kart-id / data-message) live in
+// the `html` string. So: JSON-parse, then run the button parser on j.html (a proper decoded HTML string).
+// The other branches remain as fallbacks for any endpoint that shapes rows differently.
 function _kniExtractRaw(text, add){
   if (!text) return false;
   let any = false;
   let j = null; try { j = JSON.parse(text); } catch (e) {}
-  if (j && _kniParse(j, add)) any = true;
+  if (j && typeof j === 'object'){
+    for (const k of ['html', 'table', 'content', 'view', 'body']){
+      if (typeof j[k] === 'string' && j[k].length > 20){
+        try { for (const b of parseKartNoteButtons(j[k])) if (b.kartNoteId != null && add(b.kartNoteId, b.rfKartId, b.note)) any = true; } catch (e) {}
+      }
+    }
+    if (_kniParse(j, add)) any = true;
+  }
+  if (any) return true;
   const unesc = String(text).replace(/\\u003c/gi, '<').replace(/\\u003e/gi, '>').replace(/\\u0026/gi, '&').replace(/\\"/g, '"').replace(/\\\//g, '/');
   try { for (const b of parseKartNoteButtons(unesc)) if (b.kartNoteId != null && add(b.kartNoteId, b.rfKartId, b.note)) any = true; } catch (e) {}
   // Raw attribute scan as a final fallback (edit button carries id + kart + message; order-tolerant).
@@ -804,7 +814,7 @@ function _kniExtractRaw(text, add){
 async function _kniFetch(url){
   const out = [], seen = new Set();
   const add = (id, kart, note) => { const n = Number(id); if (!n || seen.has(n)) return false; seen.add(n); out.push({ kartNoteId: n, rfKartId: (kart != null && /^\d+$/.test(String(kart))) ? Number(kart) : null, note: note != null ? String(note).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() : null }); return true; };
-  let text = ''; try { text = await (await rf(url, { ajax: true })).text(); } catch (e) { return []; }
+  let text = ''; try { text = await (await rf(url, { ajax: true })).text(); } catch (e) { return { data: [], sample: '' }; }
   _kniExtractRaw(text, add);
   return { data: out, sample: text.slice(0, 600) };
 }
@@ -1158,4 +1168,4 @@ async function main() {
 }
 
 if (require.main === module) main().catch((e) => { console.error(e); process.exit(1); });
-module.exports = { login, rfJson, enumerateKarts, syncKart, statusFast, reconcileToday, logTrackSegments, refreshLiveTracks, sweepNotesAll, notesFast, notesFromNotifications, notesFromKartNotesPage, getKartNoteIndex, readKartNotes };
+module.exports = { login, rfJson, enumerateKarts, syncKart, statusFast, reconcileToday, logTrackSegments, refreshLiveTracks, sweepNotesAll, notesFast, notesFromNotifications, notesFromKartNotesPage, getKartNoteIndex, readKartNotes, _kniExtractRaw };
