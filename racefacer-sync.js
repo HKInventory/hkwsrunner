@@ -764,6 +764,20 @@ async function notesFast(garageFlags) {
     // the fetch re-reads the REAL notes, so nothing is ever wrongly pruned.
     if (garageFlags) for (const id of garageFlags) if (!dbFlag.has(id)) toCheck.add(id);   // new note
     for (const id of dbFlag) if (!(garageFlags && garageFlags.has(id))) toCheck.add(id);    // cleared
+    // ALSO re-check karts the DB believes still have an OPEN note. A note RESOLVED in place — e.g. a
+    // repair punched straight into RaceFacer clears the note but the kart often still carries a note
+    // flag on the list — won't show up in the flag diff above, so without this it lingers until the
+    // 15-min sweep. Open-note karts are few, so when there are only a handful we re-check them ALL
+    // every cycle (resolutions clear in ~one poll); past that we rotate a third each cycle to bound cost.
+    const act = [...dbFlag];
+    if (act.length) {
+      if (act.length <= 8) { for (const id of act) toCheck.add(id); }
+      else {
+        const SLICE = Math.ceil(act.length / 3);
+        for (let i = 0; i < SLICE; i++) toCheck.add(act[(_noteCursor + i) % act.length]);
+        _noteCursor = (_noteCursor + SLICE) % act.length;
+      }
+    }
   } else {
     // No note indicator on the list this cycle: re-check every DB-tracked kart (catches edits + clears)
     // plus a rotating batch of the rest so a brand-new note on a clean kart is still found within a

@@ -338,6 +338,63 @@ async function rfCreateNote(row){
   const fail = rfFailure(r.status, txt, j);
   if (fail){ await rfDebug('note', row.rf_kart_id, `notes/add refused: ${fail}`, txt); throw new Error(`notes/add: ${fail}`); }
 }
+
+// Note-queue rows are either a CREATE (default) or a DELETE (action:'delete', carrying the note's
+// RaceFacer notification_id). This dispatcher keeps drainTable generic.
+async function rfNoteAction(row){
+  if (row.action === 'delete') return rfDeleteNote(row);
+  return rfCreateNote(row);
+}
+
+// Clear a note on RaceFacer — the same thing the X button on the kart-details note row does. It needs
+// the note's RaceFacer notification_id (rf_notification_id, captured by activeNoteMap when the note was
+// read in). The exact clear endpoint isn't in any capture yet, so we (a) log the note row's markup from
+// the kart-details page — which contains the X button and therefore the real endpoint — to rf_debug on
+// the first real delete, and (b) try the likeliest endpoints. Once the rf_debug 'note_delete' row shows
+// the actual call, we lock the correct one in and drop the rest.
+async function rfDeleteNote(row){
+  const nid = row.rf_notification_id != null ? row.rf_notification_id : row.notification_id;
+  if (nid == null || nid === '') { console.log(`[rf-push] note delete #${row.id}: no notification_id — nothing to clear on RaceFacer`); return; }
+  const ctx = await formContext(row.rf_kart_id);   // CSRF token + kart context
+
+  // One-time: dump the kart-details active-notes markup so we can SEE the X button's real handler.
+  try {
+    if (!global.__noteDelCapDone) {
+      const rr = await fetch(`${RF_BASE}/ajax/garage/kart-details?id=${row.rf_kart_id}`, { agent, headers: rfHeaders({ Accept:'application/json' }), redirect:'manual' });
+      absorb(rr);
+      const { txt: dtxt, j: dj } = await rfBody(rr);
+      const html = (dj && dj.html) || dtxt || '';
+      await rfDebug('note_delete_html', row.rf_kart_id, `kart-details notes markup (X button = the real clear endpoint) for notif ${nid}`, String(html).slice(0, 20000));
+      global.__noteDelCapDone = true;
+    }
+  } catch (e) { /* diagnostic only */ }
+
+  const referer = `${RF_BASE}/en/administration/garage/garage?kart_id=${row.rf_kart_id}`;
+  const candidates = [
+    { url:`/ajax/garage/notes/delete`,        body:{ id:String(nid), note_id:String(nid), notification_id:String(nid), kart_id:String(row.rf_kart_id), _token:ctx.token } },
+    { url:`/ajax/garage/notification/delete`, body:{ id:String(nid), notification_id:String(nid), kart_id:String(row.rf_kart_id), _token:ctx.token } },
+    { url:`/ajax/notification/delete`,        body:{ id:String(nid), note_id:String(nid), _token:ctx.token } },
+    { url:`/ajax/garage/notes/remove`,        body:{ id:String(nid), note_id:String(nid), kart_id:String(row.rf_kart_id), _token:ctx.token } },
+  ];
+  let lastTxt = '';
+  for (const c of candidates){
+    try {
+      const r = await fetch(`${RF_BASE}${c.url}`, { method:'POST', agent, redirect:'manual',
+        headers: rfHeaders({ 'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8', 'X-CSRF-Token':ctx.token, Referer:referer }),
+        body: new URLSearchParams(c.body) });
+      absorb(r);
+      if (r.status===401 || /login/i.test(r.headers.get('location')||'')) { loggedIn=false; throw new Error('session expired'); }
+      const { txt, j } = await rfBody(r);
+      lastTxt = `${c.url} -> ${r.status} ${String(txt).slice(0,180)}`;
+      if (r.status >= 200 && r.status < 400 && !rfFailure(r.status, txt, j)) {
+        console.log(`[rf-push] note ${nid} cleared on RaceFacer via ${c.url}`);
+        return;   // success — the note is gone on RF, so the next read-back won't resurrect it
+      }
+    } catch (e){ if (/session expired/.test(e.message||'')) throw e; lastTxt = `${c.url} threw ${e.message}`; }
+  }
+  await rfDebug('note_delete', row.rf_kart_id, `no clear endpoint matched for notif ${nid} — see note_delete_html for the X button`, lastTxt);
+  throw new Error(`note delete: no endpoint matched (check rf_debug note_delete_html)`);
+}
 async function rfCreateDamage(row){
   const ctx = await formContext(row.rf_kart_id);
   const user_id = resolveUser(row.user_name, ctx.users);
@@ -576,6 +633,17 @@ async function drainTable(table, submit, scrape){
   if (!rows || !rows.length) return;
   if (!loggedIn) await rfLogin();
   for (const row of rows){
+    // ATOMIC CLAIM — flip pending->sending and keep the row ONLY if this call won it. Postgres makes
+    // the conditional update atomic, so if a second drain (realtime + poll) OR a second runner instance
+    // is racing the same queue, exactly one wins and the note is pushed to RaceFacer ONCE. This is what
+    // stops the "sent twice" duplicates. A row left in 'sending' (worker died mid-push) is simply never
+    // re-selected, so a crash can't cause a double either.
+    let won = false;
+    try {
+      const { data: claim } = await supa.from(table).update({ status:'sending' }).eq('id', row.id).eq('status','pending').select('id');
+      won = !!(claim && claim.length);
+    } catch (e){ won = false; }
+    if (!won) continue;
     try {
       await submit(row);
       if (typeof scrape === 'function') await scrape(row.rf_kart_id); // land real id, no dupes
@@ -583,7 +651,7 @@ async function drainTable(table, submit, scrape){
       // notification_id is what makes RaceFacer resolve the kart note this repair came from.
       // If it is null/0 here, the note will stay open no matter what the app shows.
       const nid = (table === 'rf_repair_queue') ? ` notification_id=${row.notification_id == null ? 'NULL (note will NOT clear)' : row.notification_id}` : '';
-      console.log(`[rf-push] ${table} #${row.id} by ${row.user_name} (kart ${row.kart_name}) -> sent${nid}`);
+      console.log(`[rf-push] ${table} #${row.id}${row.action ? ' ('+row.action+')' : ''} by ${row.user_name} (kart ${row.kart_name}) -> sent${nid}`);
     } catch (e){
       loggedIn = false;
       await supa.from(table).update({ status:'error', error:String(e).slice(0,500) }).eq('id', row.id);
@@ -598,7 +666,7 @@ async function drainAll(scrape){
     do {
       _redrain = false;
       await drainTable('rf_repair_queue', rfCreateDamage, scrape);
-      await drainTable('rf_note_queue', rfCreateNote, scrape);
+      await drainTable('rf_note_queue', rfNoteAction, scrape);
       await drainTable('rf_status_queue', rfCreateStatus, scrape);
       await drainTable('rf_kart_edit_queue', rfEditKart);
     } while (_redrain);
