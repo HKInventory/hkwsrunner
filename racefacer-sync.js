@@ -760,7 +760,8 @@ async function rfMaybeJson(path){ try { const t = await (await rf(path, { ajax:t
 // probe); once found it's memoised and just re-fetched cheaply. The notes loop calls with {probe:false} so
 // it never pays the discovery cost — it only benefits once a probe has found the endpoint.
 let _kni = { at: 0, data: [] };     // short cache of the resolved index
-let _kniUrl;                        // undefined=unprobed, ''=none found, else the working URL
+let _kniSrc = null;                 // null=unknown, 'table'=ajax endpoint works, 'page'=page HTML works
+let _kniFailed = false;             // true only when BOTH sources returned nothing (used for back-off)
 let _kniProbeAt = 0, _kniDiag = false;
 const _KNI_BACKOFF = 60 * 1000;   // short: a failed probe should not lock deletes out of the id lookup for long
 
@@ -812,55 +813,38 @@ function _kniExtractRaw(text, add){
   if (!any) grab(/data-id="(\d+)"[^>]{0,120}?data-kart-id="(\d+)"()/g);
   return any;
 }
-async function _kniFetch(url){
+// Fetch the note index from the global Kart Notes PAGE (rows are server-rendered there, unlike the
+// kart-notes-table ajax which returns an empty shell without params). Returns [] on miss.
+async function _fetchNotesViaPage(){
   const out = [], seen = new Set();
   const add = (id, kart, note, archived) => { const n = Number(id); if (!n || seen.has(n)) return false; seen.add(n); out.push({ kartNoteId: n, rfKartId: (kart != null && /^\d+$/.test(String(kart))) ? Number(kart) : null, note: note != null ? String(note).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() : null, archived: archived === true ? true : (archived === false ? false : null) }); return true; };
-  let text = ''; try { text = await (await rf(url, { ajax: true })).text(); } catch (e) { return { data: [], sample: '' }; }
-  _kniExtractRaw(text, add);
-  return { data: out, sample: text.slice(0, 600) };
+  try {
+    const html = await (await rf('/en/administration/garage/kart-notes')).text();
+    if (/name=["']password["']|\/auth\/login/i.test(html || '')) throw new Error('session expired');
+    for (const r of parseKartNotesTableRows(html)) add(r.kartNoteId, r.rfKartId, r.note, r.archived);
+  } catch (e) { if (/session expired/.test(e.message || '')) throw e; }
+  return out;
 }
 async function getKartNoteIndex({ probe = true } = {}){
   if (_kni.data.length && Date.now() - _kni.at < 4000) return _kni.data;
-  if (typeof _kniUrl === 'string' && _kniUrl){                 // known-good endpoint -> just refetch it
-    const r = await _kniFetch(_kniUrl);
-    if (r.data.length){ _kni = { at: Date.now(), data: r.data }; return r.data; }
-    _kniUrl = undefined;                                       // stopped working -> allow a reprobe
-  }
-  if (!probe) return [];
-  if (_kniUrl === '' && Date.now() - _kniProbeAt < _KNI_BACKOFF) return [];
+  // Known source -> just refetch it (kept fast + memoised so the loop and deletes both get fresh data).
+  if (_kniSrc === 'table'){ const r = await _kniFetch('/ajax/garage/kart-notes-table'); if (r.data.length){ _kni = { at: Date.now(), data: r.data }; return r.data; } _kniSrc = null; }
+  if (_kniSrc === 'page'){ const d = await _fetchNotesViaPage(); if (d.length){ _kni = { at: Date.now(), data: d }; return d; } _kniSrc = null; }
+  // Only genuine "both sources failed" state backs off. A working page source is NOT a back-off.
+  if (_kniSrc === null && _kniFailed && Date.now() - _kniProbeAt < _KNI_BACKOFF) return [];
   _kniProbeAt = Date.now();
 
-  // The endpoint is CONFIRMED from a browser capture: GET /ajax/garage/kart-notes-table. Try it FIRST and
-  // ALONE — the earlier version discovered candidate URLs from the page and probed them all sequentially,
-  // which could stall the whole notes loop for a long time. Discovery is now a capped fallback only.
+  // 1) the confirmed ajax endpoint (may return an empty shell -> no data -> fall through)
   {
     const r = await _kniFetch('/ajax/garage/kart-notes-table');
-    if (r.data.length){ _kniUrl = '/ajax/garage/kart-notes-table'; _kni = { at: Date.now(), data: r.data }; console.log(`[notes] kart-note index: ${r.data.length} notes via /ajax/garage/kart-notes-table`); return r.data; }
-    // It answered but we parsed nothing -> put the raw bytes where we can see them (Render log + rf_debug).
-    if (r.sample){ console.log(`[notes] kart-notes-table gave no parseable notes — sample: ${r.sample.slice(0, 220).replace(/\s+/g, ' ')}`); if (!_kniDiag){ _kniDiag = true; try { await rfDebug('kart_notes_table_sample', 0, 'kart-notes-table response did not parse — match these bytes', r.sample); } catch (e) {} } }
+    if (r.data.length){ _kniSrc = 'table'; _kni = { at: Date.now(), data: r.data }; console.log(`[notes] kart-note index: ${r.data.length} notes via kart-notes-table`); return r.data; }
+    if (r.sample && !_kniDiag){ _kniDiag = true; try { await rfDebug('kart_notes_table_sample', 0, 'kart-notes-table returned no parseable rows (empty shell?) — using the page instead', r.sample); } catch (e) {} }
   }
+  // 2) the page (rows are rendered in its HTML) — this is the source that actually works here
+  const d = await _fetchNotesViaPage();
+  if (d.length){ _kniSrc = 'page'; _kniFailed = false; _kni = { at: Date.now(), data: d }; console.log(`[notes] kart-note index: ${d.length} notes via kart-notes page`); return d; }
 
-  // Fallback discovery: read the page for inline rows + a table ajax URL. Capped and filtered so it
-  // can never turn into a long sequential probe again. Rows come via the row parser so each entry
-  // carries its archived state — required for the storm-proof diff above.
-  const out = [], seen = new Set();
-  const add = (id, kart, note, archived) => { const n = Number(id); if (!n || seen.has(n)) return false; seen.add(n); out.push({ kartNoteId: n, rfKartId: (kart != null && /^\d+$/.test(String(kart))) ? Number(kart) : null, note: note != null ? String(note) : null, archived: archived === true ? true : (archived === false ? false : null) }); return true; };
-  let cands = [];
-  try {
-    const html = await (await rf('/en/administration/garage/kart-notes')).text();
-    for (const r of parseKartNotesTableRows(html)) add(r.kartNoteId, r.rfKartId, r.note, r.archived);
-    const disc = []; let m;
-    const re = /["'](\/ajax\/[a-z0-9_\/-]*note[a-z0-9_\/-]*(?:table|list)[a-z0-9_\/-]*)["']/gi;
-    while ((m = re.exec(html))) disc.push(m[1]);
-    cands = [...new Set(disc)].filter((u) => !/(add|delete|edit|create|update)/i.test(u)).slice(0, 4);
-  } catch (e) {}
-  if (out.length){ _kniUrl = ''; _kni = { at: Date.now(), data: out }; return out; }
-  for (const url of cands){
-    const r = await _kniFetch(url);
-    if (r.data.length){ _kniUrl = url; _kni = { at: Date.now(), data: r.data }; console.log(`[notes] kart-note index: ${r.data.length} notes via ${url}`); return r.data; }
-  }
-  _kniUrl = '';
-  _kni = { at: Date.now(), data: [] };
+  _kniSrc = null; _kniFailed = true; _kni = { at: Date.now(), data: [] };
   return [];
 }
 
