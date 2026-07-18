@@ -244,9 +244,13 @@ async function syncSessions(rfJson){
   //     did nothing (no karts assigned until a session starts) and was the bulk of the request storm.
   //   • Finished -> never (cached in _doneFinished).
   const wanted = list.filter(s => {
-    if (_doneFinished[s.uuid]) return false;
+    if (_doneFinished[s.uuid]) return false;      // already captured its FINAL (finished) state
     const st = (s.status || '').toLowerCase();
-    if (st.includes('progress')) return true;   // live -> refresh every cycle
+    if (st.includes('progress')) return true;                                  // live -> refresh every cycle
+    // JUST FINISHED -> fetch once more to store status='finished' + final karts/laps. Without this, a
+    // race that finished WHILE the worker was up stayed stored as its last in_progress fetch, so the app's
+    // "finished sessions" screen never saw it (the session-data-empty bug). _doneFinished then stops it.
+    if (/finish|complet|closed|\bended?\b|\bdone\b/.test(st)) return true;
     if (!_seenOnce[s.uuid]) return true;          // first sighting -> fetch once to store its label/time
     return false;                                  // upcoming & already stored -> nothing changes until it starts
   }).slice(0, 25);
