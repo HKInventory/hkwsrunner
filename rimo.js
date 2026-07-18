@@ -265,17 +265,30 @@ async function _histRefreshActive(){
     // fetches BMS for that stuck session's karts every tick, 24/7 — and charging karts report
     // online:1, so they don't get skipped. That is a sustained multi-hundred-MB/hr Supabase-write
     // leak. Only sessions scheduled in the last STALE_H hours can drive logging.
-    const STALE_H = Math.max(1, parseInt(process.env.RIMO_SESS_MAX_AGE_H || '3', 10));
-    const freshCut = new Date(Date.now() - STALE_H * 3600000).toISOString();
-    const { data: sess } = await supa.from('rf_sessions')
+    // Capture a race whenever it's IN ITS CLOCK WINDOW — not only when the status says in_progress.
+    // RaceFacer doesn't always flip a finished race's status, and if we gate strictly on in_progress we
+    // miss the whole race and its cell data is lost (the recurring "no session data" problem). So we pull
+    // sessions scheduled in the last ~45 min and log any that are in_progress OR still inside their ~25-min
+    // race window. The window bound (not "3h ago") is also the bandwidth guard — a stuck session stops
+    // driving logging 25 min after it started, not hours later.
+    const WIN_MIN = Math.max(20, parseInt(process.env.RIMO_SESS_WINDOW_MIN || '45', 10));
+    const RACE_MS = Math.max(15, parseInt(process.env.RIMO_RACE_MINS || '25', 10)) * 60000;
+    const winCut = new Date(Date.now() - WIN_MIN * 60000).toISOString();
+    const { data: sessAll } = await supa.from('rf_sessions')
       .select('uuid,label,status,track,scheduled_at,ends_at')
-      .eq('status', 'in_progress')
-      .gte('scheduled_at', freshCut)
-      .limit(12);
-    const uuids = (sess || []).map(s => s.uuid);
+      .gte('scheduled_at', winCut)
+      .limit(24);
+    const nowMs = Date.now();
+    const sess = (sessAll || []).filter(s => {
+      const st = (s.status || '').toLowerCase();
+      if (st.includes('progress')) return true;
+      const start = s.scheduled_at ? Date.parse(s.scheduled_at) : 0;
+      return start && nowMs >= (start - 60000) && nowMs <= (start + RACE_MS);   // inside its race window
+    });
+    const uuids = sess.map(s => s.uuid);
     if (!uuids.length){ _histActive.karts = []; return []; }
     if (!_histSessLogged || _histSessLogged !== uuids.join(',')){ _histSessLogged = uuids.join(',');
-      console.log(`[hist] ${uuids.length} session(s) IN PROGRESS → logging: ${(sess || []).map(s => s.label + ' [' + (s.track || '?') + ']').join(', ')}`); }
+      console.log(`[hist] ${uuids.length} session(s) live/in-window → logging: ${sess.map(s => s.label + ' [' + (s.track || '?') + ' · ' + (s.status || '?') + ']').join(', ')}`); }
     const trackByUuid = {}; (sess || []).forEach(s => { trackByUuid[s.uuid] = s.track || ''; });
     const { data: runs } = await supa.from('rf_session_runs')
       .select('kart_no,fleet_management_id,session_uuid')
