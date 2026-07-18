@@ -22,6 +22,11 @@ const SITE = (process.env.SITE || 'sydney').trim().toLowerCase();   // lowercase
 // How often to run the FULL sync (repairs/parts/notes/prune). Between those, only
 // kart status is refreshed, which is fast. Default 5 min; tune with HEAVY_INTERVAL_SEC.
 const HEAVY_INTERVAL_MS = Math.max(60000, (parseInt(process.env.HEAVY_INTERVAL_SEC, 10) || 300) * 1000);
+// How often the heavy child does the EXPENSIVE per-kart detail/parts loop (230 karts x 2 RaceFacer
+// fetches). This data (km/hours/cost/parts_history) changes slowly and isn't what status/notes latency
+// depends on, so it runs on its own long cadence; the frequent heavy runs then only do incremental
+// repairs + reconcile, which is nearly free on RaceFacer. Default 30 min; tune with KART_DETAILS_SEC.
+const KART_DETAILS_INTERVAL_MS = Math.max(300000, (parseInt(process.env.KART_DETAILS_SEC, 10) || 1800) * 1000);
 
 const insecure = new Agent({ connect: { rejectUnauthorized: false } }); // accept the self-signed cert
 
@@ -1301,33 +1306,51 @@ async function main() {
   try { repairsByKart = await syncAllRepairs({ fullSweep: repairsFull }); } // whole-fleet damage list -> rf_repairs / rf_repair_parts (+ map for reconcile)
   catch (e) { console.error('[repairs] full-fleet sync failed:', e.message); }
 
-  // Per-kart detail/parts sync, PARALLELIZED with a bounded worker pool and NO inter-kart sleep. The old
-  // sequential loop (230 karts x sleep(150) + fetches) ran ~60-90s and was the single biggest thing
-  // pinning the shared RaceFacer box and starving the in-process status/notes loops. A pool finishes the
-  // fleet in ~15-25s, so the contention window shrinks dramatically. Concurrency matches sweepNotesAll's
-  // proven profile; statusFast already ran up-front (above) and keeps running every ~2s in the main
-  // process, so it no longer needs interleaving here. (Heavy child skips per-kart NOTES via
-  // HEAVY_SKIP_KART_NOTES — see syncKart — so this is just details + parts.)
-  const perKart = [], skipIds = new Set();
-  const entries = [...idMap.entries()];
-  let _ki = 0;
-  const KART_CONC = Math.max(2, Math.min(8, parseInt(process.env.HEAVY_KART_CONCURRENCY, 10) || 6));
-  async function _kartWorker(){
-    while (_ki < entries.length){
-      const [id, meta] = entries[_ki++];
-      try { const k = await syncKart(id, meta, repairsByKart); if (k && k.skipped) skipIds.add(id); else if (k) perKart.push(k); }
-      catch (e) { console.error(`kart ${id}: ${e.message}`); }
+  // Per-kart detail/parts sync (km/hours/cost/brand/model + parts_history) is EXPENSIVE — 230 karts x 2
+  // RaceFacer fetches — and its data changes slowly, so it runs on its OWN ~30min cadence, NOT every
+  // heavy run. That's the key to keeping status/notes un-starved: the frequent heavy runs now cost almost
+  // nothing on RaceFacer (incremental repairs is ~1 page), and this heavy per-kart burst only lands
+  // occasionally. Status is served by the main loop, so throttling this doesn't affect status freshness.
+  let doKartDetails = !haveFleet;
+  try { const st = await sb('rf_sync_state?k=eq.last_kartdetails&select=v'); const last = (st && st[0] && st[0].v) ? (Date.parse(st[0].v) || 0) : 0; if (Date.now() - last >= KART_DETAILS_INTERVAL_MS) doKartDetails = true; }
+  catch (e) { doKartDetails = true; }
+
+  let perKart = [], pruned = 0;
+  if (doKartDetails) {
+    // Full parallel per-kart sync + prune. Bounded worker pool, no inter-kart sleep -> ~15-25s. Concurrency
+    // matches sweepNotesAll's proven profile. (Heavy child skips per-kart NOTES via HEAVY_SKIP_KART_NOTES —
+    // see syncKart — so this is just details + parts.)
+    const skipIds = new Set();
+    const entries = [...idMap.entries()];
+    let _ki = 0;
+    const KART_CONC = Math.max(2, Math.min(8, parseInt(process.env.HEAVY_KART_CONCURRENCY, 10) || 6));
+    async function _kartWorker(){
+      while (_ki < entries.length){
+        const [id, meta] = entries[_ki++];
+        try { const k = await syncKart(id, meta, repairsByKart); if (k && k.skipped) skipIds.add(id); else if (k) perKart.push(k); }
+        catch (e) { console.error(`kart ${id}: ${e.message}`); }
+      }
     }
+    await Promise.all(Array.from({ length: Math.min(KART_CONC, entries.length) }, () => _kartWorker()));
+    if (skipIds.size) console.log(`[skip] ${skipIds.size} non-numeric-named karts (George/Late/test) excluded.`);
+    const keepIds = [...idMap.keys()].filter((id) => !skipIds.has(id));   // real karts only (incl. ones that transiently failed)
+    pruned = await pruneStale(keepIds);
+    if (pruned) console.log(`[prune] removed ${pruned} stale/ghost karts no longer listed under any type.`);
+  } else {
+    // Skip the expensive per-kart RaceFacer loop this run. reconcile only needs each kart's LABEL and its
+    // REPAIRS, both of which we already have (repairs from syncAllRepairs; labels from the DB) — so build
+    // the reconcile input directly, with zero per-kart RaceFacer fetches. kart details/parts_history just
+    // stay as the last detail-run left them (slow-changing; not what status/notes latency depends on).
+    let nameMap = new Map();
+    try { for (const k of (await sb('rf_karts?select=rf_id,name,label')) || []) nameMap.set(Number(k.rf_id), k); } catch (e) {}
+    for (const [kid, reps] of repairsByKart) { const m = nameMap.get(Number(kid)); if (!m) continue; perKart.push({ id: kid, name: m.name, label: m.label, repairs: reps }); }
+    console.log(`[heavy] per-kart detail sync skipped this run (own ~${Math.round(KART_DETAILS_INTERVAL_MS / 60000)}min cadence); reconciling ${perKart.length} kart(s) from already-fetched repairs.`);
   }
-  await Promise.all(Array.from({ length: Math.min(KART_CONC, entries.length) }, () => _kartWorker()));
-  if (skipIds.size) console.log(`[skip] ${skipIds.size} non-numeric-named karts (George/Late/test) excluded.`);
-  const keepIds = [...idMap.keys()].filter((id) => !skipIds.has(id));   // real karts only (incl. ones that transiently failed)
-  const pruned = await pruneStale(keepIds);
-  if (pruned) console.log(`[prune] removed ${pruned} stale/ghost karts no longer listed under any type.`);
   const aliases = await refreshAliases(perKart.flatMap((k) => k.repairs.flatMap((r) => (r.parts || []).map((p) => p.name))));
   const n = await reconcileToday(perKart, aliases);
   const now = new Date().toISOString();
   const stateRows = [{ k: 'last_sync', v: now, at: now }, { k: 'last_heavy', v: now, at: now }];
+  if (doKartDetails) stateRows.push({ k: 'last_kartdetails', v: now, at: now });   // reset the ~30min per-kart-detail clock
   if (repairsFull) stateRows.push({ k: 'last_repairs_full', v: now, at: now });   // reset the hourly full-repairs clock
   await sb('rf_sync_state?on_conflict=k', { method: 'POST', prefer: 'resolution=merge-duplicates', body: stateRows });
   console.log(`Done. ${perKart.length} karts synced, ${pruned} ghosts removed, ${n} discrepancies flagged for today.`);
