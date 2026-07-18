@@ -139,7 +139,7 @@ async function statusLoop(){
 // this cadence bounds how fast an RF-side note add/delete reaches the app. gzip (see _fetchNotesViaPage)
 // drops the page to ~100KB on the wire, so a 30s sweep is affordable within the outbound cap. Tune live
 // with NOTES_PAGE_SEC (lower = snappier notes, more box load; the box still has to render the page).
-const NOTES_PAGE_MS = Math.max(15, parseInt(process.env.NOTES_PAGE_SEC || '30', 10)) * 1000;
+const NOTES_PAGE_MS = Math.max(8, parseInt(process.env.NOTES_PAGE_SEC || '10', 10)) * 1000;
 let _lastNotesMode = null, _lastSweepAt = Date.now(), _lastNotesPageAt = 0;
 async function notesLoop(){
   let fails = 0;
@@ -234,7 +234,7 @@ function loop(tag, gapMs, extraEnv){
   return { start(delay){ timer = setTimeout(run, delay || 0); }, stop(){ clearTimeout(timer); } };
 }
 
-log(`combined worker up · site=${SITE} · pusher live · status ~${STATUS_POLL / 1000}s · notes ~${NOTES_POLL / 1000}s (flagged) / ~${NOTES_POLL_ROTATE / 1000}s (rotating) · full-sync ~${HEAVY_GAP / 1000}s · build=kni-fix-2026-07-18t`);
+log(`combined worker up · site=${SITE} · pusher live · status ~${STATUS_POLL / 1000}s · notes ~${NOTES_POLL / 1000}s (flagged) / ~${NOTES_POLL_ROTATE / 1000}s (rotating) · full-sync ~${HEAVY_GAP / 1000}s · build=kni-fix-2026-07-18u`);
 
 // SESSIONS: poll RaceFacer session-management on the SAME shared login, so the app + HK AI
 // know which karts are in which session (and their time windows). Write-on-change; prunes to 7 days.
