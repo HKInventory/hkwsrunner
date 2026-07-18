@@ -894,9 +894,17 @@ async function notesFromKartNotesPage(){
   //       notes on the SAME kart (e.g. "Slowing down to speed 1" and "...randomly" as two separate active
   //       notes), and a prefix match silently picked the wrong one — an id that then could never
   //       self-correct, because backfill only ever touched rows where the id was still null.
-  //    b) rows that already HAVE an id — verify it: if the page's note at that id doesn't match the DB's
-  //       stored text at all (proof of a bad prior assignment, like a-b above), clear it back to null so
-  //       pass (a) can re-resolve it correctly on this same run.
+  //    b) rows that already HAVE an id — verify it, but ONLY on a KART mismatch (this id now belongs to a
+  //       note on a DIFFERENT kart on RaceFacer — real proof of a stale/reassigned id). Do NOT clear on a
+  //       TEXT mismatch alone: page.note comes from the Kart Notes page's `data-message` attribute while
+  //       the DB's note came from the per-kart endpoint's rendered table cell (parseKartNotesTableRows vs
+  //       parseKartNotes in racefacer-parse.js) — two independently-formatted sources for the same note
+  //       (attribute truncation/escaping vs cell text) that are NOT guaranteed to match exactly even when
+  //       they're the same note. Treating that drift as "bad assignment" was clearing valid ids every
+  //       cycle; on multi-note karts the singleton fallback below can't re-resolve them, so the id was lost
+  //       for good — which is what kept rf_kart_note_id backfilled-then-reset in a non-converging loop and
+  //       silently broke app->RaceFacer note deletes (rfDeleteNote needs this id to clear the Kart Notes
+  //       list entry).
   try {
     const openByKart = new Map();
     for (const b of idx) { if (b.archived !== false || b.rfKartId == null) continue; if (!openByKart.has(b.rfKartId)) openByKart.set(b.rfKartId, []); openByKart.get(b.rfKartId).push(b); }
@@ -907,10 +915,10 @@ async function notesFromKartNotesPage(){
     const toClear = [];
     for (const n of withId){
       const page = byId.get(Number(n.rf_kart_note_id));
-      if (page && Number(page.rfKartId) === Number(n.rf_kart_id) && !_noteMatch(page.note, n.note)) toClear.push(n.id);
+      if (page && Number(page.rfKartId) !== Number(n.rf_kart_id)) toClear.push(n.id);
     }
     if (toClear.length){
-      console.log(`[notes] backfill: clearing ${toClear.length} rf_kart_note_id(s) that point to a mismatched note (self-correcting a prior bad assignment)`);
+      console.log(`[notes] backfill: clearing ${toClear.length} rf_kart_note_id(s) reassigned to a different kart on RaceFacer (self-correcting a stale id)`);
       for (const id of toClear){ try { await sb(`rf_kart_notes?id=eq.${id}`, { method:'PATCH', prefer:'return=minimal', body:{ rf_kart_note_id: null } }); } catch (e) {} }
     }
 
