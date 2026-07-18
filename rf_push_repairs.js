@@ -248,17 +248,30 @@ const CTX_TTL = 20000;         // back-to-back notes/repairs to a kart reuse it 
 async function formContext(kartId){
   const hit = _ctxCache.get(kartId);
   if (hit && Date.now() - hit.at < CTX_TTL) return hit.ctx;
-  const url = `${RF_BASE}/en/administration/garage/damage?kart_id=${kartId}`;
-  const r = await fetch(url, { agent, headers: rfHeaders({ Referer: url }), redirect:'manual' });
-  absorb(r);
-  if (r.status === 302 || /login/i.test(r.headers.get('location')||'')) { loggedIn = false; throw new Error('session expired'); }
-  const html = await r.text();
-  const token = html.match(/name="_token"[^>]*value="([^"]+)"/)?.[1] || html.match(/csrf-token"[^>]*content="([^"]+)"/)?.[1] || '';
-  const users = parseOptions(html, 'name="user_id"');
-  const parts = await resolvePartsList(html, kartId);
-  const kart_type_id = Number(html.match(/kart_type_id["']?\s*[:=]\s*["']?(\d+)/i)?.[1] || html.match(/name="kart_type"[^>]*value="(\d+)"/i)?.[1] || 0);
-  const ctx = { token, users, parts, kart_type_id, html };
-  _ctxCache.set(kartId, { ctx, at: Date.now() });
+  async function fetchOnce(){
+    const url = `${RF_BASE}/en/administration/garage/damage?kart_id=${kartId}`;
+    const r = await fetch(url, { agent, headers: rfHeaders({ Referer: url }), redirect:'manual' });
+    absorb(r);
+    if (r.status === 302 || /login/i.test(r.headers.get('location')||'')) { loggedIn = false; throw new Error('session expired'); }
+    const html = await r.text();
+    const token = html.match(/name="_token"[^>]*value="([^"]+)"/)?.[1] || html.match(/csrf-token"[^>]*content="([^"]+)"/)?.[1] || '';
+    const users = parseOptions(html, 'name="user_id"');
+    const parts = await resolvePartsList(html, kartId);
+    const kart_type_id = Number(html.match(/kart_type_id["']?\s*[:=]\s*["']?(\d+)/i)?.[1] || html.match(/name="kart_type"[^>]*value="(\d+)"/i)?.[1] || 0);
+    return { token, users, parts, kart_type_id, html };
+  }
+  let ctx = await fetchOnce();
+  // A damage page with ZERO user_id options means the form didn't render — a stale/contended session or
+  // a soft login bounce, NOT a genuinely empty roster. That is exactly what made a real note/repair fail
+  // with "no RaceFacer user_id for …" (the intermittent "nothing happened" on save). Re-login and retry
+  // once before trusting it, and NEVER cache an empty context (the old code cached it for 20s, so every
+  // push in that window failed).
+  if (!ctx.users || !Object.keys(ctx.users).length){
+    console.log(`[rf-push] formContext(kart ${kartId}): 0 users parsed — re-login + retry once`);
+    try { await rfLogin(); } catch (e) {}
+    try { ctx = await fetchOnce(); } catch (e) { /* keep the first ctx; caller handles empties */ }
+  }
+  if (ctx.users && Object.keys(ctx.users).length) _ctxCache.set(kartId, { ctx, at: Date.now() });
   return ctx;
 }
 let _loggedRfUsers = false;
@@ -595,8 +608,27 @@ async function fetchKartRecord(kartId){
 async function syncKartRecords(){
   try{
     if (!loggedIn) await rfLogin();
-    const recs = await fetchKartsInfo(true);
+    // Cover EVERY kart type. RaceFacer's karts-info scopes its response to the sample kart's
+    // track/type context, so a single sample only mirrors that one type — karts of other types
+    // never land in rf_kart_admin and their Admin tab degrades to "type + server only". Pull one
+    // representative kart id per distinct type from the fleet we already track and MERGE every
+    // response (dedupe by id) so all karts get their full record mirrored.
+    let samples = [];
+    try{
+      const { data } = await supa.from('rf_karts').select('rf_id,type').not('rf_id','is',null);
+      const byType = {};
+      for (const r of (data || [])){ const t = (r.type || '?'); if (byType[t] == null){ const n = Number(r.rf_id); if (Number.isFinite(n)) byType[t] = n; } }
+      samples = Object.values(byType);
+    }catch{}
+    if (!samples.length) samples = [Number(process.env.RF_SAMPLE_KART) || 26];
+    const merged = new Map();
+    for (const sid of samples){
+      const part = await fetchKartsInfo(true, sid);
+      for (const x of (part || [])){ if (x && x.id != null) merged.set(Number(x.id), x); }
+    }
+    const recs = Array.from(merged.values());
     if (!recs.length){ console.log("[rf-push] kart records: none parsed -> select payload from rf_debug where kind='edit_kart' order by id desc limit 1;"); return; }
+    console.log(`[rf-push] kart records: merged ${recs.length} across ${samples.length} type-sample(s)`);
     const now = new Date().toISOString();
     const rows = recs.map(x => ({ rf_kart_id: Number(x.id), fields: x, updated_at: now }));
     // One-time visibility: are kart_type_id / safety_server_id actually present per kart? If they're
