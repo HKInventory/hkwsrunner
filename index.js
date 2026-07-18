@@ -88,12 +88,12 @@ function ensureLoginStatus(){ if (!_loginSP) _loginSP = sync.loginStatus().then(
 function dropLoginStatus(){ _loginSP = null; }
 function sleep(ms){ return new Promise((r) => setTimeout(r, ms)); }
 
-// STATUS loop — tight and independent. Just the ~5 garage list pages + write-changed status. This no
-// longer waits on notes, so a status flip in RaceFacer reaches the app in ~one STATUS_POLL (~3s) no
-// matter what the notes loop is doing. statusFast() also parses per-kart note-flags off the SAME pages
-// (free) and stashes them on statusFast._noteFlags for the notes loop to consume. refreshLiveTracks
-// (session-schedule fetch + track writes) is comparatively slow and only changes minute-to-minute, so it
-// runs on its own ~15s cadence rather than padding every status cycle.
+// STATUS loop — tight and independent. statusFast() now reads all kart statuses from ONE karts-info JSON
+// request (falling back to the ~6 garage list pages only if that endpoint is scoped/unavailable), so a
+// status flip in RaceFacer reaches the app in ~one STATUS_POLL and status no longer competes with the
+// notes loop for the box. (Note-flags are no longer sourced here — notes have their own detection path.)
+// refreshLiveTracks (session-schedule fetch + track writes) is comparatively slow and only changes
+// minute-to-minute, so it runs on its own ~15s cadence rather than padding every status cycle.
 const LIVE_TRACKS_MS = Math.max(8000, (parseInt(process.env.LIVE_TRACKS_SEC || '15', 10)) * 1000);
 let _lastLiveTracks = 0;
 async function statusLoop(){
