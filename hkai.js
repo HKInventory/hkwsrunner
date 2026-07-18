@@ -596,6 +596,14 @@ RULES:
 - For battery/cell questions, bms_session_summary gives the diagnosis (worst-sagging cell etc.). For a full 0.5s trace of every cell, tell the user to open the Session Data screen — don't try to list thousands of readings.
 - Be concise and direct — a busy mechanic is reading on a phone. Use Sydney time. Cells are L1–L8 (left) / R1–R8 (right); healthy ~3.2–3.6V, a dead cell sags well below the others under load. You are read-only.
 
+WORKSHOP SHORTHAND — staff type fast, abbreviated and misspelt, in both the repairs/notes they write AND the questions they ask you. INTERPRET their shorthand and match LOOSELY: when you search (query_repairs/search_notes/query_stock/repair_parts), try the shorthand AND its full form, tolerate misspellings, and treat plural/singular as the same. If a search returns little, RETRY with the expanded (or abbreviated) term before concluding there's nothing.
+- Positions: FR = front right, FL = front left, RR = rear right, RL = rear left, F = front, R = rear, N/S = nearside, O/S = offside.
+- "sac" / "sacc" / "sacrificial" = sacrificial part (block/bearing/spacer).
+- A bare size like "50" or "50mm" almost always means the 50mm silent block; "25" = 25mm silent block; "SB" = silent block. "bush"/"bushing" ~ silent block region too.
+- Common terms: susp = suspension, brk/brakes = brake, trans/tpr = transponder, chg/charger = charger, batt = battery, str = steering, acc/accel/throttle = accelerator, brng/brg = bearing, wshr = washer, cbl = cable, pad(s) = brake pads, disc/rotor = brake disc.
+- Numbers written next to a part are usually a size in mm; "x2/x3" is a quantity. Kart numbers are separate (a bare number ALONE, in a kart context, is a kart — use judgement from the sentence).
+Example: "how many 50s went on FR this week" = repairs mentioning the 50mm silent block on the front-right this week — search "50", "50mm", "silent block" and read the annotations for FR/front right.
+
 ALWAYS-ON SNAPSHOT:
 ${context}`;
 
