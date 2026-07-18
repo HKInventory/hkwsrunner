@@ -899,10 +899,14 @@ function _kniExtractRaw(text, add){
   if (!any) grab(/data-id="(\d+)"[^>]{0,120}?data-kart-id="(\d+)"()/g);
   return any;
 }
+// The kart-notes-table ajax route returned an "empty shell" until we sent the same Referer/Origin the
+// karts-info endpoint needed (RaceFacer gates its ajax JSON on the request looking like it came from the
+// matching admin page). Send them so this fast source can actually populate.
+const KNI_HEADERS = { 'Origin': RF_BASE, 'Referer': `${RF_BASE}/en/administration/garage/kart-notes` };
 async function _kniFetch(url){
   const out = [], seen = new Set();
   const add = (id, kart, note, archived) => { const n = Number(id); if (!n || seen.has(n)) return false; seen.add(n); out.push({ kartNoteId: n, rfKartId: (kart != null && /^\d+$/.test(String(kart))) ? Number(kart) : null, note: note != null ? String(note).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() : null, archived: archived === true ? true : (archived === false ? false : null) }); return true; };
-  let text = ''; try { text = await (await rf(url, { ajax: true })).text(); } catch (e) { return { data: [], sample: '' }; }
+  let text = ''; try { text = await (await rf(url, { ajax: true, headers: KNI_HEADERS })).text(); } catch (e) { return { data: [], sample: '' }; }
   _kniExtractRaw(text, add);
   return { data: out, sample: text.slice(0, 600) };
 }
@@ -1283,6 +1287,7 @@ async function sweepNotesAll({ concurrency = 8 } = {}) {
 // STATUS_VIA_KARTS_INFO=0 disables the new path entirely.
 let _kiMode = null;            // null = unprobed, 'karts-info' = proven, 'garage-pages' = fallback
 let _kiFails = 0, _kiRetryAt = 0, _kiValidated = false, _kiRawDumped = false;
+let _kiPath = null;            // the karts-info route that actually answers on this build (probed once)
 async function statusFast() {
   // WRITE-ON-CHANGE: read each kart's CURRENT status_code, and only write back the karts whose
   // status actually flipped this cycle. Re-writing all ~190 karts every cycle (even unchanged)
@@ -1315,15 +1320,24 @@ async function statusFast() {
       // Referer + Origin + Accept:application/json headers or RaceFacer bounces it to a redirect and the
       // body isn't JSON — which is why an earlier header-less attempt got 0 records in 428ms.
       const kiHeaders = { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest', 'Origin': RF_BASE, 'Referer': `${RF_BASE}/en/administration/settings/karts` };
+      // The route differs across builds: /ajax/kart/karts-info 404s here, /ajax/garage/karts-info answers
+      // (the pusher proves it in the same process). Try both, cache the one that returns JSON, then reuse it.
+      const KI_PATHS = ['/ajax/garage/karts-info', '/ajax/kart/karts-info'];
       let _rawSample = '';
-      const responses = await Promise.all(reps.map(async (rep, i) => {
-        try {
-          const r = await rf(`/ajax/kart/karts-info?kart_id=${rep}`, { jar: pool[i % pool.length], headers: kiHeaders });
-          if (r.status === 302 || r.status >= 400) { if (!_rawSample) _rawSample = `HTTP ${r.status} -> ${r.headers.get('location') || ''}`; return null; }
-          const text = await r.text();
-          try { return JSON.parse(text); } catch { if (!_rawSample) _rawSample = text.slice(0, 300); return null; }
-        } catch (e) { return null; }
-      }));
+      const kiGet = async (rep, jarX) => {
+        for (const p of (_kiPath ? [_kiPath] : KI_PATHS)){
+          try {
+            const r = await rf(`${p}?kart_id=${rep}`, { jar: jarX, headers: kiHeaders });
+            if (r.status === 302 || r.status >= 400){ if (!_rawSample) _rawSample = `HTTP ${r.status} @ ${p} -> ${r.headers.get('location') || ''}`; continue; }
+            const text = await r.text();
+            let j; try { j = JSON.parse(text); } catch { if (!_rawSample) _rawSample = `${p}: ${text.slice(0, 200)}`; continue; }
+            if (!_kiPath){ _kiPath = p; console.log(`[fast] karts-info path locked: ${p}`); }
+            return j;
+          } catch (e) { /* try next path */ }
+        }
+        return null;
+      };
+      const responses = await Promise.all(reps.map((rep, i) => kiGet(rep, pool[i % pool.length])));
       const kiMs = Date.now() - t0req;
       const recs = [], seenRec = new Set();
       // require id; kart_status_id is what we need for status (the pusher confirms records carry it).
