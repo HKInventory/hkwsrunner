@@ -150,19 +150,25 @@ async function fetchDetail(rfJson, uuid, subTrack){
   // the rest — and stop the moment we find karts. Once resolved, steady-state is ONE fetch per session.
   const first = _subTrackFor[uuid] || subTrack;
   const order = first ? [first].concat(SUB_TRACKS.filter(x => x !== first)) : SUB_TRACKS;
-  let fallback = null, fallbackSt = null;
+  // Pick the FULLEST roster across sub-tracks, not just the first with any karts — querying a session under
+  // the "wrong" sub_track can return a partial (e.g. 1 kart) when another returns the whole field, which is
+  // why sessions showed "1 kart". Stop early once a real roster (>= GOOD) is found to keep requests down.
+  const GOOD = Math.max(1, parseInt(process.env.RF_SESS_GOOD_ROSTER || '5', 10));
+  let best = null, bestSt = null, bestN = -1, fallback = null, fallbackSt = null;
   for (const st of order){
     try {
       const j = await rfJson(`/ajax/session-management/session?type=session&uuid=${uuid}&sub_track_id=${st}`, 1);
       const sd = j && (j.session_data || j.session || j.data);
       if (sd && (sd.uuid || sd.label || sd.runs)){
         const nRuns = ((sd.runs && (sd.runs.data || sd.runs)) || []).length;
-        if (nRuns > 0){ _subTrackFor[uuid] = st; return sd; }   // real karts — cache this track, done
-        if (!fallback){ fallback = sd; fallbackSt = st; }        // remember an empty view in case no track has karts
+        if (nRuns > bestN){ best = sd; bestSt = st; bestN = nRuns; }
+        if (nRuns >= GOOD){ _subTrackFor[uuid] = st; return sd; }   // a real roster — good enough, stop scanning
+        if (!fallback){ fallback = sd; fallbackSt = st; }
       }
     } catch (e) { /* try next sub-track */ }
   }
-  if (fallbackSt != null) _subTrackFor[uuid] = fallbackSt;   // cache even an empty hit, so we don't rescan all six
+  if (best && bestN > 0){ _subTrackFor[uuid] = bestSt; return best; }   // fullest partial we saw (fixes "1 kart")
+  if (fallbackSt != null) _subTrackFor[uuid] = fallbackSt;               // cache even an empty hit
   return fallback;
 }
 
