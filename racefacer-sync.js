@@ -12,7 +12,7 @@ const { fetch, Agent } = require('undici');
 const crypto = require('crypto');
 // Short stable hash of a repair row's content — a changed field (incl. mechanic) changes the hash.
 function contentHash(s){ return crypto.createHash('sha1').update(String(s)).digest('base64').slice(0, 20); }
-const { parseKartDetails, parseRepairs, parseParts, parseKartNotes, parseActiveNotes, parseGarageStatuses, parseNotificationsList, parseKartNoteButtons } = require('./racefacer-parse');
+const { parseKartDetails, parseRepairs, parseParts, parseKartNotes, parseActiveNotes, parseGarageStatuses, parseNotificationsList, parseKartNoteButtons, parseKartNotesTableRows } = require('./racefacer-parse');
 const { reconcileDay } = require('./racefacer-reconcile');
 
 const RF_BASE = process.env.RF_BASE || 'https://103.166.146.163';
@@ -797,23 +797,24 @@ function _kniExtractRaw(text, add){
   if (j && typeof j === 'object'){
     for (const k of ['html', 'table', 'content', 'view', 'body']){
       if (typeof j[k] === 'string' && j[k].length > 20){
-        try { for (const b of parseKartNoteButtons(j[k])) if (b.kartNoteId != null && add(b.kartNoteId, b.rfKartId, b.note)) any = true; } catch (e) {}
+        try { for (const r of parseKartNotesTableRows(j[k])) if (add(r.kartNoteId, r.rfKartId, r.note, r.archived)) any = true; } catch (e) {}
       }
     }
-    if (_kniParse(j, add)) any = true;
+    if (!any && _kniParse(j, add)) any = true;
   }
   if (any) return true;
   const unesc = String(text).replace(/\\u003c/gi, '<').replace(/\\u003e/gi, '>').replace(/\\u0026/gi, '&').replace(/\\"/g, '"').replace(/\\\//g, '/');
-  try { for (const b of parseKartNoteButtons(unesc)) if (b.kartNoteId != null && add(b.kartNoteId, b.rfKartId, b.note)) any = true; } catch (e) {}
-  // Raw attribute scan as a final fallback (edit button carries id + kart + message; order-tolerant).
-  const grab = (re) => { let m; while ((m = re.exec(unesc))) { const id = Number(m[1]); const kart = m[2] != null ? Number(m[2]) : null; const msg = m[3] != null ? m[3] : null; if (add(id, kart, msg)) any = true; } };
+  try { for (const r of parseKartNotesTableRows(unesc)) if (add(r.kartNoteId, r.rfKartId, r.note, r.archived)) any = true; } catch (e) {}
+  // Raw attribute scan as a final fallback — archived state unknowable here, so pass null (treated as
+  // "present but not provably open": never counted as a new note, never treated as deleted).
+  const grab = (re) => { let m; while ((m = re.exec(unesc))) { const id = Number(m[1]); const kart = m[2] != null ? Number(m[2]) : null; const msg = m[3] != null ? m[3] : null; if (add(id, kart, msg, null)) any = true; } };
   grab(/data-id="(\d+)"[^>]{0,120}?data-kart-id="(\d+)"[^>]{0,200}?data-message="([^"]*)"/g);
   if (!any) grab(/data-id="(\d+)"[^>]{0,120}?data-kart-id="(\d+)"()/g);
   return any;
 }
 async function _kniFetch(url){
   const out = [], seen = new Set();
-  const add = (id, kart, note) => { const n = Number(id); if (!n || seen.has(n)) return false; seen.add(n); out.push({ kartNoteId: n, rfKartId: (kart != null && /^\d+$/.test(String(kart))) ? Number(kart) : null, note: note != null ? String(note).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() : null }); return true; };
+  const add = (id, kart, note, archived) => { const n = Number(id); if (!n || seen.has(n)) return false; seen.add(n); out.push({ kartNoteId: n, rfKartId: (kart != null && /^\d+$/.test(String(kart))) ? Number(kart) : null, note: note != null ? String(note).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() : null, archived: archived === true ? true : (archived === false ? false : null) }); return true; };
   let text = ''; try { text = await (await rf(url, { ajax: true })).text(); } catch (e) { return { data: [], sample: '' }; }
   _kniExtractRaw(text, add);
   return { data: out, sample: text.slice(0, 600) };
@@ -839,14 +840,15 @@ async function getKartNoteIndex({ probe = true } = {}){
     if (r.sample){ console.log(`[notes] kart-notes-table gave no parseable notes — sample: ${r.sample.slice(0, 220).replace(/\s+/g, ' ')}`); if (!_kniDiag){ _kniDiag = true; try { await rfDebug('kart_notes_table_sample', 0, 'kart-notes-table response did not parse — match these bytes', r.sample); } catch (e) {} } }
   }
 
-  // Fallback discovery: read the page for inline buttons + a table ajax URL. Capped and filtered so it
-  // can never turn into a long sequential probe again.
+  // Fallback discovery: read the page for inline rows + a table ajax URL. Capped and filtered so it
+  // can never turn into a long sequential probe again. Rows come via the row parser so each entry
+  // carries its archived state — required for the storm-proof diff above.
   const out = [], seen = new Set();
-  const add = (id, kart, note) => { const n = Number(id); if (!n || seen.has(n)) return false; seen.add(n); out.push({ kartNoteId: n, rfKartId: (kart != null && /^\d+$/.test(String(kart))) ? Number(kart) : null, note: note != null ? String(note) : null }); return true; };
+  const add = (id, kart, note, archived) => { const n = Number(id); if (!n || seen.has(n)) return false; seen.add(n); out.push({ kartNoteId: n, rfKartId: (kart != null && /^\d+$/.test(String(kart))) ? Number(kart) : null, note: note != null ? String(note) : null, archived: archived === true ? true : (archived === false ? false : null) }); return true; };
   let cands = [];
   try {
     const html = await (await rf('/en/administration/garage/kart-notes')).text();
-    for (const b of parseKartNoteButtons(html)) if (b.kartNoteId != null) add(b.kartNoteId, b.rfKartId, b.note);
+    for (const r of parseKartNotesTableRows(html)) add(r.kartNoteId, r.rfKartId, r.note, r.archived);
     const disc = []; let m;
     const re = /["'](\/ajax\/[a-z0-9_\/-]*note[a-z0-9_\/-]*(?:table|list)[a-z0-9_\/-]*)["']/gi;
     while ((m = re.exec(html))) disc.push(m[1]);
@@ -869,32 +871,49 @@ async function getKartNoteIndex({ probe = true } = {}){
 //   • detect ADDS  (a note on the page that isn't active in the DB)  -> fetch that kart,
 //   • detect DELETES (a note active in the DB that's gone from the page) -> re-fetch that kart to prune.
 // Returns karts synced, or null if the page yields no buttons (server-side table) so the caller falls back.
+let _knBaselined = false, _knChangedCursor = 0;
 async function notesFromKartNotesPage(){
-  const btns = (await getKartNoteIndex()).filter((b) => b.rfKartId != null && b.note != null);
-  if (!btns.length) return null;
+  const idx = (await getKartNoteIndex()).filter((b) => b.rfKartId != null && b.note != null);
+  if (!idx.length) return null;
 
   // 1) Backfill kart_note_id onto active notes that don't have it yet (minimal writes; skips ones already set).
   try {
     const need = (await sb('rf_kart_notes?active=eq.true&rf_kart_note_id=is.null&select=id,rf_kart_id,note')) || [];
     for (const n of need){
-      const m = btns.find((b) => Number(b.rfKartId) === Number(n.rf_kart_id) && _noteMatch(b.note, n.note));
+      const m = idx.find((b) => Number(b.rfKartId) === Number(n.rf_kart_id) && _noteMatch(b.note, n.note));
       if (m && m.kartNoteId != null){ try { await sb(`rf_kart_notes?id=eq.${n.id}`, { method:'PATCH', prefer:'return=minimal', body:{ rf_kart_note_id: m.kartNoteId } }); } catch (e) {} }
     }
   } catch (e) {}
 
-  // 2) Diff the page's current notes against the DB's active set -> fetch only karts that changed.
+  // 2) Diff — OPEN notes only. The table lists the FULL history (open AND archived); comparing all of it
+  //    against the DB's active set made every historical note look "new" and re-fetched ~150 karts every
+  //    cycle — a fleet-wide storm that was burning the Render bandwidth cap. So:
+  //      • ADDS:    only rows provably OPEN (archived === false) count as candidate new notes.
+  //      • DELETES: a DB-active note counts as gone only if it's absent from the table entirely OR its row
+  //                 is provably archived. archived === null (fallback parse) counts as "still present".
+  //      • BASELINE: the first successful read after startup must not trigger a mass fetch — the heavy
+  //                 sync owns any backlog.
+  //      • CAP:     at most 12 kart fetches per cycle, rotating through any overflow.
+  const open = idx.filter((b) => b.archived === false);
   let dbActive = [];
   try { dbActive = (await sb('rf_kart_notes?active=eq.true&select=rf_kart_id,note')) || []; } catch (e){ return 0; }
   const keyOf = (kart, note) => `${kart}|${_normNote(note)}`;
   const dbKeys = new Set(dbActive.map((n) => keyOf(n.rf_kart_id, n.note)));
-  const pageKeys = new Set(btns.map((b) => keyOf(b.rfKartId, b.note)));
+  const presentKeys = new Set(idx.filter((b) => b.archived !== true).map((b) => keyOf(b.rfKartId, b.note)));
   const changed = new Set();
-  for (const b of btns){ if (!dbKeys.has(keyOf(b.rfKartId, b.note))) changed.add(Number(b.rfKartId)); }         // new/edited note on RF
-  for (const n of dbActive){ if (!pageKeys.has(keyOf(n.rf_kart_id, n.note))) changed.add(Number(n.rf_kart_id)); } // note gone from RF
-  const ids = [...changed].filter((x) => x != null && !Number.isNaN(x));
+  for (const b of open){ if (!dbKeys.has(keyOf(b.rfKartId, b.note))) changed.add(Number(b.rfKartId)); }          // new OPEN note on RF
+  for (const n of dbActive){ if (!presentKeys.has(keyOf(n.rf_kart_id, n.note))) changed.add(Number(n.rf_kart_id)); } // deleted/archived on RF
+  let ids = [...changed].filter((x) => x != null && !Number.isNaN(x));
+  if (!_knBaselined){
+    _knBaselined = true;
+    if (ids.length > 12){ console.log(`[notes] baseline: ${ids.length} kart(s) differ from DB — leaving the backlog to the heavy sync`); return 0; }
+  }
+  if (ids.length > 40) console.log(`[notes] diff anomaly: ${ids.length} kart(s) flagged — capping to protect bandwidth`);
+  const CAP = 12;
+  if (ids.length > CAP){ const take = []; for (let i = 0; i < CAP; i++) take.push(ids[(_knChangedCursor + i) % ids.length]); _knChangedCursor = (_knChangedCursor + CAP) % ids.length; ids = take; }
   if (!ids.length) return 0;
-  let touched = 0, idx = 0;
-  async function w(){ while (idx < ids.length){ const id = ids[idx++]; await readKartNotes(id); touched++; } }
+  let touched = 0, i2 = 0;
+  async function w(){ while (i2 < ids.length){ const id = ids[i2++]; await readKartNotes(id); touched++; } }
   await Promise.all(Array.from({ length: Math.min(6, ids.length) }, () => w()));
   return touched;
 }

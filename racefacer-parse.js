@@ -272,4 +272,28 @@ function parseKartNoteButtons(html) {
   return out;
 }
 
-module.exports = { parseKartDetails, parseRepairs, parseParts, parseKartNotes, parseActiveNotes, parseGarageStatuses, parseNotificationsList, parseKartNoteButtons, analysePartWear };
+// ROW-AWARE version of the above: parses whole <tr> rows so each note carries its ARCHIVED state.
+// The global Kart Notes table lists the FULL history (open AND archived notes) — diffing it against the
+// DB's active set without this flag makes every historical note look "new" and storms the fleet.
+// A row shows one date-time (created) when open, two (created + archived) when archived.
+function parseKartNotesTableRows(html) {
+  const $ = cheerio.load(html || '');
+  const out = [];
+  $('tr').each((_, tr) => {
+    const $tr = $(tr);
+    const $edit = $tr.find('a[onclick*="show_edit_kart_note"]').first();
+    const $del  = $tr.find('a[onclick*="delete_kart_note"]').first();
+    const id = ($edit.attr('data-id') || $del.attr('data-id') || '').trim();
+    if (!/^\d+$/.test(id)) return;
+    const kid = ($edit.attr('data-kart-id') || '').trim();
+    let note = $edit.attr('data-message');
+    if (note == null || note === '') {
+      $tr.children('td').each((__, td) => { if (note) return; const t = txt($(td).text()); if (t && !/^\d{2}\.\d{2}\.\d{4}/.test(t) && !/^\d{1,3}$/.test(t)) note = t; });
+    }
+    const dates = (txt($tr.text()).match(/\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}/g) || []).length;
+    out.push({ kartNoteId: Number(id), rfKartId: /^\d+$/.test(kid) ? Number(kid) : null, note: note != null ? String(note) : null, archived: dates >= 2 });
+  });
+  return out;
+}
+
+module.exports = { parseKartDetails, parseRepairs, parseParts, parseKartNotes, parseActiveNotes, parseGarageStatuses, parseNotificationsList, parseKartNoteButtons, parseKartNotesTableRows, analysePartWear };
