@@ -1136,8 +1136,20 @@ async function notesFast(garageFlags, opts) {
   const dbFlag = new Set(dbActive.map((r) => r.rf_kart_id).filter((x) => x != null));
 
   const sawFlags = !!(statusFast && statusFast._sawFlags);
+  const flagsOnly = !!(opts && opts.flagsOnly);
   const toCheck = new Set();
-  if (sawFlags) {
+  // FLAGS-ONLY (used by the in-process fast loop): fetch ONLY karts whose note-flag flipped this cycle —
+  // a clean kart that gained its first note, or a kart that lost its last note. Costs ~0 fetches on a
+  // stable fleet. Deliberately does NOT re-check every open-note kart (that's dozens of fetches on a
+  // note-heavy fleet and was starving status) and does NOT rotate — a 2nd note on an already-flagged
+  // kart, an in-place resolve, or anything the flags can't see is caught by the periodic global
+  // Kart Notes page sweep instead. With no list-flags this cycle there's no cheap signal, so do nothing.
+  if (flagsOnly) {
+    if (sawFlags) {
+      if (garageFlags) for (const id of garageFlags) if (!dbFlag.has(id)) toCheck.add(id);   // new note on a clean kart
+      for (const id of dbFlag) if (!(garageFlags && garageFlags.has(id))) toCheck.add(id);    // last note cleared
+    }
+  } else if (sawFlags) {
     // Authoritative list-flags => fetch ONLY karts whose note state CHANGED since the DB was written:
     //   • flagged on the list but NOT in the DB  -> a NEW note appeared -> fetch + write it.
     //   • in the DB but NO LONGER flagged        -> the note was CLEARED -> fetch + prune it.

@@ -68,7 +68,7 @@ const NOTES_CONC  = Math.max(2, Math.min(12, parseInt(process.env.NOTES_CONCURRE
 //   • rotating      -> NO signal, so every cycle blind-fetches a batch; keep this gentler to respect the ~105GB/mo
 //                      outbound cap (fast blind rotation across ~190 karts would blow it). This path is the reason
 //                      note-adds are slow; the real fix is a working signal (see notesFromNotifications).
-const NOTES_POLL        = Math.max(2, parseInt(process.env.NOTES_POLL_SEC        || '20', 10)) * 1000;
+const NOTES_POLL        = Math.max(2, parseInt(process.env.NOTES_POLL_SEC        || '5',  10)) * 1000;
 const NOTES_POLL_ROTATE = Math.max(5, parseInt(process.env.NOTES_POLL_ROTATE_SEC || '20', 10)) * 1000;
 // Safety-net FULL sweep on a wall-clock timer (catches the rare change no targeted pass can see, e.g. a note
 // edited in place whose list-flag never changes).
@@ -127,44 +127,48 @@ async function statusLoop(){
 //      rotating fallback. Also re-checks DB-open notes so an in-place resolve clears fast.
 // Cadence adapts: fast when we have a cheap signal (notifications list or list-flags), gentle when we're
 // blind-rotating, so we never breach the outbound bandwidth cap chasing notes.
-let _lastNotesMode = null, _lastSweepAt = Date.now();
+// The global Kart Notes page has ~1700 notes and takes up to ~20s to fetch under race load — fetching it
+// every cycle (and re-checking every open-note kart) is what was starving status. So it now runs on its
+// OWN slow timer for the authoritative sweep, while every fast cycle does only the cheap flag-diff.
+const NOTES_PAGE_MS = Math.max(30, parseInt(process.env.NOTES_PAGE_SEC || '90', 10)) * 1000;
+let _lastNotesMode = null, _lastSweepAt = Date.now(), _lastNotesPageAt = 0, _flagWarned = false;
 async function notesLoop(){
-  let fails = 0, ticks = 0;
-  await sleep(1500);   // let statusLoop populate note-flags on its first pass
+  let fails = 0;
+  await sleep(2500);   // let statusLoop populate note-flags on its first pass
   while (!stopping){
     const t0 = Date.now();
-    let haveSignal = false;
     try {
       await ensureLogin();
-      // 1) authoritative fleet-wide detector — handles ADDS *and* DELETES in one cheap request.
-      //    Prefer the global Kart Notes page (real, parseable, and also backfills kart_note_id); fall back
-      //    to the notifications list if that page can't be read.
-      let viaList = null, listSrc = null;
-      if (typeof sync.notesFromKartNotesPage === 'function') {
-        try { viaList = await sync.notesFromKartNotesPage(); if (viaList != null) listSrc = 'kart-notes-page'; }
-        catch (e) { viaList = null; log(`notes-page error: ${e.message}`); if (/login|session|401|403/i.test(e.message || '')) dropLogin(); }
-      }
-      if (viaList == null && typeof sync.notesFromNotifications === 'function') {
-        try { viaList = await sync.notesFromNotifications(); if (viaList != null) listSrc = 'notifications-list'; }
-        catch (e) { viaList = null; log(`notes-list error: ${e.message}`); if (/login|session|401|403/i.test(e.message || '')) dropLogin(); }
-      }
-      // 2) fallback ONLY when neither list could be read — flag-diff for adds/clears, else gentle rotation.
-      //    When a list works it already covers adds+deletes, so we skip this entirely (cheaper + faster).
+      // 1) FAST, CHEAP every cycle: flag-diff only. Fetches ONLY karts whose note-flag flipped (clean
+      //    kart gained a note / kart lost its last note) — ~0 fetches on a stable fleet. This is the
+      //    instant path for the common add/delete and it does NOT touch the giant page.
       let touched = 0;
-      if (viaList == null) {
-        try { touched = await sync.notesFast(sync.statusFast && sync.statusFast._noteFlags); }
-        catch (e) { log(`notes error: ${e.message}`); if (/login|session|401|403/i.test(e.message || '')) dropLogin(); }
+      try { touched = await sync.notesFast(sync.statusFast && sync.statusFast._noteFlags, { flagsOnly: true }); }
+      catch (e) { if (/login|session|401|403/i.test(e.message || '')) dropLogin(); }
+      if (touched) log(`notes: ${touched} kart(s) changed (flag-diff)`);
+
+      const sawFlags = !!(sync.statusFast && sync.statusFast._sawFlags);
+      if (!sawFlags && !_flagWarned) { _flagWarned = true; log(`notes: no note-flags on the garage list pages — fast add-detection unavailable, relying on the ~${NOTES_PAGE_MS / 1000}s page sweep (parser may need the list markup)`); }
+
+      // 2) AUTHORITATIVE but SLOW: the global Kart Notes page sweep — backfills rf_kart_note_id and catches
+      //    everything the flag-diff can't (a 2nd note on an already-flagged kart, in-place resolves, and
+      //    any add/delete on a fleet with no working flags). Rare, because the page is huge.
+      if (Date.now() - _lastNotesPageAt >= NOTES_PAGE_MS) {
+        _lastNotesPageAt = Date.now();
+        let viaList = null, listSrc = null;
+        if (typeof sync.notesFromKartNotesPage === 'function') {
+          try { viaList = await sync.notesFromKartNotesPage(); if (viaList != null) listSrc = 'kart-notes-page'; }
+          catch (e) { viaList = null; log(`notes-page error: ${e.message}`); if (/login|session|401|403/i.test(e.message || '')) dropLogin(); }
+        }
+        if (viaList == null && typeof sync.notesFromNotifications === 'function') {
+          try { viaList = await sync.notesFromNotifications(); if (viaList != null) listSrc = 'notifications-list'; }
+          catch (e) { viaList = null; if (/login|session|401|403/i.test(e.message || '')) dropLogin(); }
+        }
+        if (viaList) log(`notes: ${viaList} kart(s) changed & synced (${listSrc} sweep)`);
+        if (listSrc && listSrc !== _lastNotesMode) { _lastNotesMode = listSrc; log(`notes page-sweep source: ${listSrc}`); }
       }
 
-      const flagged = !!(sync.statusFast && sync.statusFast._sawFlags);
-      haveSignal = (viaList != null) || flagged;
-      const mode = listSrc || (flagged ? 'list-flagged' : 'rotating');
-      if (mode !== _lastNotesMode) { _lastNotesMode = mode; log(`notes detection mode: ${mode}`); }
-      ticks++;
-      if (viaList) log(`notes: ${viaList} kart(s) changed & synced (${mode})`);
-      else if (touched && (ticks % 15 === 0)) log(`notes: ${touched} kart(s) re-synced (${mode})`);
-
-      // wall-clock safety-net full sweep
+      // wall-clock safety-net full per-kart sweep (rare backstop)
       if (Date.now() - _lastSweepAt >= NOTES_FULL_SWEEP_MS) {
         _lastSweepAt = Date.now();
         try { await sync.sweepNotesAll({ concurrency: NOTES_CONC }); }
@@ -177,14 +181,9 @@ async function notesLoop(){
       if (fails <= 3 || fails % 10 === 0) log(`notes poll error (${fails}): ${e.message}`);
       if (fails > 3) await sleep(Math.min(30000, fails * 1000));
     }
-    // INSTRUMENTATION: same idea as statusLoop — a converged notes cycle is one page fetch + a couple of
-    // small DB reads. If it's routinely many seconds, the box is contended (or the 15min full sweep is
-    // running). This is what stretches the effective note-detection interval well past NOTES_POLL and
-    // makes note add/delete feel slow even when the poll interval is short.
     const _dt = Date.now() - t0;
-    if (_dt > 6000) log(`notes cycle SLOW: ${_dt}ms — RaceFacer contended or full-sweep running`);
-    const interval = haveSignal ? NOTES_POLL : NOTES_POLL_ROTATE;
-    await sleep(Math.max(0, interval - (Date.now() - t0)));
+    if (_dt > 6000) log(`notes cycle SLOW: ${_dt}ms — RaceFacer contended or a sweep ran this cycle`);
+    await sleep(Math.max(0, NOTES_POLL - (Date.now() - t0)));
   }
 }
 
@@ -228,7 +227,7 @@ function loop(tag, gapMs, extraEnv){
   return { start(delay){ timer = setTimeout(run, delay || 0); }, stop(){ clearTimeout(timer); } };
 }
 
-log(`combined worker up · site=${SITE} · pusher live · status ~${STATUS_POLL / 1000}s · notes ~${NOTES_POLL / 1000}s (flagged) / ~${NOTES_POLL_ROTATE / 1000}s (rotating) · full-sync ~${HEAVY_GAP / 1000}s · build=kni-fix-2026-07-18j`);
+log(`combined worker up · site=${SITE} · pusher live · status ~${STATUS_POLL / 1000}s · notes ~${NOTES_POLL / 1000}s (flagged) / ~${NOTES_POLL_ROTATE / 1000}s (rotating) · full-sync ~${HEAVY_GAP / 1000}s · build=kni-fix-2026-07-18k`);
 
 // SESSIONS: poll RaceFacer session-management on the SAME shared login, so the app + HK AI
 // know which karts are in which session (and their time windows). Write-on-change; prunes to 7 days.
