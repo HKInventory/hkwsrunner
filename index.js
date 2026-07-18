@@ -228,13 +228,16 @@ function loop(tag, gapMs, extraEnv){
   return { start(delay){ timer = setTimeout(run, delay || 0); }, stop(){ clearTimeout(timer); } };
 }
 
-log(`combined worker up · site=${SITE} · pusher live · status ~${STATUS_POLL / 1000}s · notes ~${NOTES_POLL / 1000}s (flagged) / ~${NOTES_POLL_ROTATE / 1000}s (rotating) · full-sync ~${HEAVY_GAP / 1000}s · build=kni-fix-2026-07-18h`);
+log(`combined worker up · site=${SITE} · pusher live · status ~${STATUS_POLL / 1000}s · notes ~${NOTES_POLL / 1000}s (flagged) / ~${NOTES_POLL_ROTATE / 1000}s (rotating) · full-sync ~${HEAVY_GAP / 1000}s · build=kni-fix-2026-07-18i`);
 
 // SESSIONS: poll RaceFacer session-management on the SAME shared login, so the app + HK AI
 // know which karts are in which session (and their time windows). Write-on-change; prunes to 7 days.
 async function sessionsPoller(){
   const sessions = require('./rf_sessions');
-  const SESS_POLL = Math.max(10, parseInt(process.env.RF_SESS_POLL_SEC || '20', 10)) * 1000;
+  // Sessions run ~10 min and a session's kart roster is fixed once it starts, so 20s polling was
+  // overkill and piled onto the RaceFacer contention. 60s still catches a session starting well within
+  // its run and keeps the live roster/laps fresh enough. Tune with RF_SESS_POLL_SEC.
+  const SESS_POLL = Math.max(10, parseInt(process.env.RF_SESS_POLL_SEC || '60', 10)) * 1000;
   let fails = 0;
   await sleep(6000);                                // let the status poller establish the session first
   while (!stopping){

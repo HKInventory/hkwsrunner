@@ -36,6 +36,8 @@ const sha = s => crypto.createHash('sha1').update(String(s)).digest('base64').sl
 let _schedPath = process.env.RF_SESS_SCHEDULE_PATH || null;   // learned once, reused
 let _sessHash = {};            // uuid -> content hash of last write
 let _doneFinished = {};        // uuid -> true once a FINISHED session has been stored (never refetch)
+let _seenOnce = {};            // uuid -> true once we've detail-fetched it at least once (skip refetching upcoming sessions)
+let _subTrackFor = {};         // uuid -> the sub_track_id that actually returned this session (avoid re-scanning all 6)
 let _lastPrune = 0;
 let _schedLogged = false, _failLogged = 0;
 let _trackCounts = {}, _trackCountSig = '';   // diagnostic: sessions returned per sub-track
@@ -81,7 +83,12 @@ async function fetchSchedule(rfJson, date){
     // De-dupe by uuid across tracks.
     const seen = {}, combined = [];
     let anyHit = false;
-    const tracks = tmpl.includes('{st}') ? SUB_TRACKS : [null];
+    // This RaceFacer build returns EVERY session regardless of sub_track_id (confirmed live: the
+    // per-sub-track counts are identical across 1-6), so one fetch gets the whole schedule — scanning
+    // all six was 6x the requests for the same data, every 20s. Fetch a single sub-track by default; set
+    // RF_SESS_SUBTRACK_SCAN=1 to restore the full scan if a venue genuinely splits sessions per track.
+    const scanAll = process.env.RF_SESS_SUBTRACK_SCAN === '1';
+    const tracks = tmpl.includes('{st}') ? (scanAll ? SUB_TRACKS : [SUB_TRACKS[0]]) : [null];
     for (const st of tracks){
       const path = tmpl.replace('{d}', date).replace('{st}', String(st));
       try {
@@ -123,19 +130,23 @@ async function fetchDetail(rfJson, uuid, subTrack){
   // under the wrong track. That produced "0 karts" / missing Adult races. So: try the hinted track
   // first, then the rest, and return the response that actually has karts (fall back to a label-only
   // response if none do, so genuinely-empty slots still register).
-  const order = subTrack ? [subTrack].concat(SUB_TRACKS.filter(x => x !== subTrack)) : SUB_TRACKS;
-  let fallback = null;
+  // Try the sub_track that worked LAST time for this uuid first (cached), then the schedule's hint, then
+  // the rest — and stop the moment we find karts. Once resolved, steady-state is ONE fetch per session.
+  const first = _subTrackFor[uuid] || subTrack;
+  const order = first ? [first].concat(SUB_TRACKS.filter(x => x !== first)) : SUB_TRACKS;
+  let fallback = null, fallbackSt = null;
   for (const st of order){
     try {
       const j = await rfJson(`/ajax/session-management/session?type=session&uuid=${uuid}&sub_track_id=${st}`, 1);
       const sd = j && (j.session_data || j.session || j.data);
       if (sd && (sd.uuid || sd.label || sd.runs)){
         const nRuns = ((sd.runs && (sd.runs.data || sd.runs)) || []).length;
-        if (nRuns > 0) return sd;            // real karts — this is the correct track view
-        if (!fallback) fallback = sd;        // remember an empty view in case no track has karts
+        if (nRuns > 0){ _subTrackFor[uuid] = st; return sd; }   // real karts — cache this track, done
+        if (!fallback){ fallback = sd; fallbackSt = st; }        // remember an empty view in case no track has karts
       }
     } catch (e) { /* try next sub-track */ }
   }
+  if (fallbackSt != null) _subTrackFor[uuid] = fallbackSt;   // cache even an empty hit, so we don't rescan all six
   return fallback;
 }
 
@@ -226,17 +237,24 @@ async function syncSessions(rfJson){
   const list = await fetchSchedule(rfJson, date);
   if (!list.length) return;
   const now = Date.now();
-  // Which sessions deserve a detail fetch this cycle: live ones, near-term ones, and
-  // anything we haven't stored yet. Finished + already-stored sessions are never refetched.
+  // Which sessions deserve a detail fetch THIS cycle — kept minimal so we're not hammering RaceFacer:
+  //   • IN-PROGRESS sessions -> always (their karts/laps change live).
+  //   • Sessions we've never fetched -> once (to store label/time; upcoming slots have no karts yet).
+  //   • Upcoming sessions we've already stored -> SKIP until they go in-progress. Re-fetching every 20s
+  //     did nothing (no karts assigned until a session starts) and was the bulk of the request storm.
+  //   • Finished -> never (cached in _doneFinished).
   const wanted = list.filter(s => {
     if (_doneFinished[s.uuid]) return false;
     const st = (s.status || '').toLowerCase();
-    if (st.includes('progress')) return true;
-    return true;                          // not-yet-final: sync it (cheap; write-on-change)
+    if (st.includes('progress')) return true;   // live -> refresh every cycle
+    if (!_seenOnce[s.uuid]) return true;          // first sighting -> fetch once to store its label/time
+    return false;                                  // upcoming & already stored -> nothing changes until it starts
   }).slice(0, 25);
-  let wrote = 0;
+  let wrote = 0, fetched = 0;
   for (const s of wanted){
     const sd = await fetchDetail(rfJson, s.uuid, s.sub_track_id);
+    _seenOnce[s.uuid] = true;   // mark attempted so an upcoming slot isn't re-fetched every cycle
+    fetched++;
     if (!sd) continue;
     const { sess, runRows } = rowsFromDetail(sd, s.uuid);
     const h = sha(JSON.stringify(sess) + JSON.stringify(runRows));
@@ -260,7 +278,7 @@ async function syncSessions(rfJson){
     if (finished) _doneFinished[s.uuid] = true;
     wrote++;
   }
-  if (wrote) console.log(`[sessions] ${wrote} session(s) written (${list.length} on today's schedule)`);
+  if (wrote || fetched) console.log(`[sessions] ${wrote} written / ${fetched} detail-fetched (${list.length} on today's schedule; only live + first-seen are fetched)`);
   // Diagnostic: which track_configuration values are actually present in what we fetched today.
   // If this only ever shows Intermediate, Adult sessions aren't coming back from RaceFacer at all
   // (schedule/detail endpoint or sub_track_id issue), not an app-display problem.
