@@ -804,6 +804,8 @@ async function readKartNotes(id){
 let _notifHighWater = 0;      // epoch(ms) of the newest notification we've already acted on
 let _notifDiagDone = false;
 let _goneCursor = 0;
+let _prevLiveNotifIds = null; // notification_ids seen on the notifications list LAST cycle (edge-triggered deletes)
+let _notifMatchWarned = false, _notifDryCycles = 0;
 let _knPageDiagDone = false;
 const _normNote = (s) => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
 // EXACT match only (after whitespace/case normalization) — deliberately NOT a prefix/substring match.
@@ -1102,22 +1104,35 @@ async function notesFromNotifications(){
 
   const changed = new Set();
 
-  // --- DELETES: DB says active, but the id isn't on the current list any more -> re-fetch to prune. ---
-  // Gated on having parsed some ids (so a parse that missed ids can't nuke everything). Bounded per cycle.
+  // --- DELETES: EDGE-triggered. A note is "deleted" only when its notification_id was on the list LAST
+  //     cycle and is GONE this cycle (present->absent transition) AND it's still an active note in the DB.
+  //     This is deliberately NOT the level-triggered "every DB-active id not on the current list" — that
+  //     version churns forever if the list is windowed/paginated or if parseNotificationsList and
+  //     parseActiveNotes extract the id differently (a stored id that never appears on the list would look
+  //     permanently deleted, re-fetched every 5s). Edge-triggering fires each id at most ONCE when it
+  //     actually vanishes, so it converges; deletes that predate our snapshot are caught by the 90s page
+  //     sweep. Both sides of this diff come from the SAME parser (liveIds), so it can't self-disagree.
   if (liveIds.size){
     try {
       const active = (await sb('rf_kart_notes?active=eq.true&rf_notification_id=not.is.null&select=rf_kart_id,rf_notification_id')) || [];
-      const gone = [];
-      for (const n of active){ if (n.rf_notification_id != null && !liveIds.has(Number(n.rf_notification_id)) && n.rf_kart_id != null) gone.push(n.rf_kart_id); }
-      const goneKarts = [...new Set(gone)];
-      // Bound the per-cycle re-fetch so a pathological/paginated list can't cause a fetch storm; rotate
-      // through any overflow so a real delete is still caught within a cycle or two.
-      const CAP = 20;
-      let take = goneKarts;
-      if (goneKarts.length > CAP){ take = []; for (let i = 0; i < CAP; i++) take.push(goneKarts[(_goneCursor + i) % goneKarts.length]); _goneCursor = (_goneCursor + CAP) % goneKarts.length; }
-      for (const id of take) changed.add(id);
+      const activeById = new Map();
+      for (const n of active){ if (n.rf_notification_id != null && n.rf_kart_id != null) activeById.set(Number(n.rf_notification_id), n.rf_kart_id); }
+      if (_prevLiveNotifIds){
+        for (const id of _prevLiveNotifIds){ if (!liveIds.has(id) && activeById.has(id)) changed.add(activeById.get(id)); }   // vanished + still a live DB note
+      }
+      // DIAGNOSTIC: if the DB has active notification_ids but NONE of them ever appear on the list, the two
+      // id sources disagree (or the list is windowed) — delete-via-notifications can't work; the page sweep
+      // still handles deletes. Log once so the parser can be fixed, without ever churning.
+      if (activeById.size >= 10){
+        let overlap = 0; for (const id of activeById.keys()) if (liveIds.has(id)) overlap++;
+        if (overlap === 0){ if (++_notifDryCycles >= 12 && !_notifMatchWarned){ _notifMatchWarned = true;
+          console.log(`[notes] notifications list ids never match stored rf_notification_ids (${activeById.size} active, 0 on list) — deletes rely on the ${'90'}s page sweep; add-detection still works`);
+          try { await rfDebug('notif_id_mismatch', 0, 'notifications-list notifId vs stored rf_notification_id never overlap', JSON.stringify({ sampleLive: [...liveIds].slice(0, 8), sampleDb: [...activeById.keys()].slice(0, 8) })); } catch (e) {} } }
+        else _notifDryCycles = 0;
+      }
     } catch (e){ /* delete-diff is best-effort; adds below still run */ }
   }
+  _prevLiveNotifIds = liveIds;   // snapshot for next cycle's edge comparison (only when we parsed a real list)
 
   // --- ADDS: a note newer than the high-water mark -> pull that kart. First read just sets the mark. ---
   if (!_notifHighWater){ _notifHighWater = newest; }
@@ -1151,23 +1166,16 @@ async function notesFast(garageFlags, opts) {
   try { dbActive = (await sb('rf_kart_notes?active=eq.true&select=rf_kart_id')) || []; } catch (e) {}
   const dbFlag = new Set(dbActive.map((r) => r.rf_kart_id).filter((x) => x != null));
 
+  // NOTE: the former `flagsOnly` fast path is GONE. It was built on the garage-list note-flag heuristic
+  // (parseGarageStatuses' broad icon/title match), which proved false-positive on this venue's markup:
+  // "flagged but not active in DB" stayed permanently non-empty, so it re-fetched the same 12 karts every
+  // cycle forever (~144 wasted GET/min) and starved status. Fast note-adds are now driven by
+  // notesFromNotifications (ONE request/cycle) in index.js's notesLoop, with the periodic global
+  // Kart Notes page sweep as the authoritative backstop. This function remains for the legacy
+  // STATUS_ONLY/NOTES_ONLY spawned modes only.
   const sawFlags = !!(statusFast && statusFast._sawFlags);
-  const flagsOnly = !!(opts && opts.flagsOnly);
   const toCheck = new Set();
-  // FLAGS-ONLY (used by the in-process fast loop): fetch ONLY karts whose note-flag flipped this cycle —
-  // a clean kart that gained its first note, or a kart that lost its last note. Costs ~0 fetches on a
-  // stable fleet. Deliberately does NOT re-check every open-note kart (that's dozens of fetches on a
-  // note-heavy fleet and was starving status) and does NOT rotate — a 2nd note on an already-flagged
-  // kart, an in-place resolve, or anything the flags can't see is caught by the periodic global
-  // Kart Notes page sweep instead. With no list-flags this cycle there's no cheap signal, so do nothing.
-  if (flagsOnly) {
-    // ADDS ONLY: a kart the garage list flags as having a note that the DB doesn't know yet -> likely a
-    // NEW note. We deliberately do NOT do the inverse ("DB-open but not flagged -> cleared"): this venue's
-    // list note-flags are INCOMPLETE (they mark only a fraction of note-bearing karts), so treating every
-    // unflagged open-note kart as cleared re-fetched ~98 karts EVERY cycle and starved status. Deletes /
-    // resolves, and any add the incomplete flags miss, are handled by the periodic global-page sweep.
-    if (sawFlags && garageFlags) for (const id of garageFlags) if (!dbFlag.has(id)) toCheck.add(id);
-  } else if (sawFlags) {
+  if (sawFlags) {
     // Authoritative list-flags => fetch ONLY karts whose note state CHANGED since the DB was written:
     //   • flagged on the list but NOT in the DB  -> a NEW note appeared -> fetch + write it.
     //   • in the DB but NO LONGER flagged        -> the note was CLEARED -> fetch + prune it.
@@ -1196,9 +1204,6 @@ async function notesFast(garageFlags, opts) {
   }
 
   let ids = [...toCheck];
-  // Hard safety cap on the fast (flags-only) path so a noisy/incomplete flag signal can NEVER turn into a
-  // fetch storm that starves status — the authoritative global-page sweep is the real reconciler anyway.
-  if (flagsOnly && ids.length > 12) { ids = ids.slice(0, 12); }
   if (!ids.length) return 0;
   // Fetch concurrently (bounded) rather than one-at-a-time with sleeps — a delete/resolve should clear in
   // ~one poll, not drip out over several seconds. readKartNotes never throws.
@@ -1240,6 +1245,23 @@ async function sweepNotesAll({ concurrency = 8 } = {}) {
 // (one per kart type, fetched in parallel — ~5 requests for the whole fleet) instead of
 // hitting all ~190 karts individually. Only updates karts already in rf_karts (so it's
 // always an UPDATE — never a partial insert), and only the status fields.
+// statusFast source selection. The old path fanned out ~6 concurrent garage list-page HTML fetches every
+// cycle — the single biggest steady load on the small self-hosted RaceFacer box (~120 GET/min), which is
+// per-IP throughput-bound: request-budget analysis showed status queuing at the box behind our own volume
+// (status on its own session and notes on the shared session went slow in the SAME second, ruling out
+// session- and client-level serialization; the undici Agent is uncapped, so our 6 fetches genuinely ran
+// in parallel and queued server-side). /ajax/kart/karts-info returns kart records — each carrying id +
+// kart_status_id, the SAME 1/2/3 (OK/DAMAGED/FOR MAINTENANCE) domain (see RF_STATUS_ID in
+// rf_push_repairs.js) — so the whole fleet's status can arrive in ONE JSON request. The unscoped call is
+// unproven on this box (the pusher only ever calls it ?kart_id=-scoped, which returned ONE type-group of
+// 76), so it's probed and validated, with automatic fallback to the garage pages:
+//   • parse must yield >= ~60% of the known fleet (a scoped/partial response falls back),
+//   • the FIRST successful parse is validated against the DB's current status_codes — if >30% of the
+//     fleet "disagrees", kart_status_id doesn't mean live status on this build -> fall back,
+//   • repeated fetch errors back off to the garage pages and re-probe later.
+// STATUS_VIA_KARTS_INFO=0 disables the new path entirely.
+let _kiMode = null;            // null = unprobed, 'karts-info' = proven, 'garage-pages' = fallback
+let _kiFails = 0, _kiRetryAt = 0, _kiValidated = false;
 async function statusFast() {
   // WRITE-ON-CHANGE: read each kart's CURRENT status_code, and only write back the karts whose
   // status actually flipped this cycle. Re-writing all ~190 karts every cycle (even unchanged)
@@ -1250,42 +1272,89 @@ async function statusFast() {
   catch (e) { console.error(`[fast] couldn't read fleet: ${e.message}`); return 0; }
   if (!cur.size) return 0;                             // nothing known yet — the full sync will populate it
 
-  // Only the garage pages for THIS site — no point fetching Melbourne's page on a Sydney worker every
-  // ~2s. And route them through the dedicated status session so a slow shared-session request can't lock
-  // status out server-side (see the jarStatus note at the top).
-  const uuids = Object.keys(KART_TYPES).filter((u) => (KART_TYPES[u].site || 'sydney') === SITE);
-  const sj = statusJar();
-  const lists = await Promise.all(uuids.map(async (uuid) => {
-    try { const html = await (await rf(`/en/administration/garage/garage?kart_type_uuid=${uuid}`, { jar: sj })).text(); return parseGarageStatuses(html); }
-    catch (e) { return []; }                          // a page that fails this cycle just gets skipped; the next cycle/heavy covers it
-  }));
-
   const rows = [], seen = new Set(), now = new Date().toISOString();
-  const noteFlags = new Set();   // karts the garage list shows as having an open note (if the parser exposes it)
-  let scanned = 0;
-  for (let _li = 0; _li < lists.length; _li++) {
-    const pageType = (KART_TYPES[uuids[_li]] && KART_TYPES[uuids[_li]].type) || null;   // the track type this page represents
-    for (const k of lists[_li]) {
-      if (!k.rfId || k.statusCode == null || !cur.has(k.rfId) || seen.has(k.rfId)) continue;
-      seen.add(k.rfId); scanned++;
-      // parseGarageStatuses may expose a note indicator under any of these names; harmless if absent.
-      if (k.hasNote || k.hasNotes || k.noteActive || k.note || k.notes_count > 0) noteFlags.add(k.rfId);
-      const statusChanged = cur.get(k.rfId) !== k.statusCode;
-      const typeChanged = pageType != null && curType.get(k.rfId) !== pageType;   // kart moved to another track type
-      if (!statusChanged && !typeChanged) continue;   // nothing changed this cycle: do not write, do not broadcast
-      const _row = { rf_id: k.rfId, status: k.status, status_code: k.statusCode, fetched_at: now };
-      if (pageType != null) _row.type = pageType;     // land the current track type in the same fast write
-      rows.push(_row);
+  const noteFlags = new Set();   // karts the garage list shows as having an open note (garage-page path only)
+  let scanned = 0, viaKI = false;
+
+  // ---- primary: ONE karts-info JSON request ------------------------------------------------------
+  const kiAllowed = process.env.STATUS_VIA_KARTS_INFO !== '0'
+    && (_kiMode === 'karts-info' || _kiMode === null || Date.now() >= _kiRetryAt);
+  if (kiAllowed) {
+    try {
+      const j = await rfJson('/ajax/kart/karts-info', 2, statusJar());
+      const groups = (j && (j.kart_names || j.karts || j.karts_info)) || {};
+      const recs = [];
+      for (const g in groups){ const arr = groups[g]; if (Array.isArray(arr)) for (const x of arr){ if (x && x.id != null && x.kart_status_id != null) recs.push(x); } }
+      if (!recs.length && Array.isArray(j)) for (const x of j){ if (x && x.id != null && x.kart_status_id != null) recs.push(x); }
+      if (recs.length >= cur.size * 0.6) {
+        // one-time semantic validation: kart_status_id must broadly AGREE with the DB's current
+        // status_codes (which the garage pages populated). Mass disagreement = wrong field meaning.
+        if (!_kiValidated) {
+          let agree = 0, known = 0;
+          for (const x of recs){ const id = Number(x.id); if (!cur.has(id) || cur.get(id) == null) continue; known++; if (Number(x.kart_status_id) === Number(cur.get(id))) agree++; }
+          if (known >= 20 && agree < known * 0.7) {
+            _kiMode = 'garage-pages'; _kiRetryAt = Date.now() + 6 * 3600000;   // wrong semantics won't fix itself soon
+            console.log(`[fast] karts-info kart_status_id disagrees with ${known - agree}/${known} known statuses — NOT a live-status field on this build; staying on garage pages`);
+          } else { _kiValidated = true; }
+        }
+        if (_kiValidated) {
+          if (_kiMode !== 'karts-info') { _kiMode = 'karts-info'; console.log(`[fast] status source: karts-info — ${recs.length} karts in ONE request (was ~6 garage pages/cycle)`); }
+          _kiFails = 0; viaKI = true;
+          for (const x of recs) {
+            const rfId = Number(x.id), sc = Number(x.kart_status_id);
+            if (!Number.isFinite(rfId) || !cur.has(rfId) || seen.has(rfId)) continue;
+            seen.add(rfId); scanned++;
+            if (sc !== 1 && sc !== 2 && sc !== 3) continue;      // unknown status id — skip, never guess
+            if (cur.get(rfId) === sc) continue;                  // unchanged: no write, no broadcast
+            rows.push({ rf_id: rfId, status: (sc === 2 ? 'DAMAGED' : sc === 3 ? 'FOR MAINTENANCE' : 'OK'), status_code: sc, fetched_at: now });
+            // NOTE: no `type` write on this path — karts-info's kart_type_id is numeric with no
+            // name/site map in this codebase; track-type moves are owned by the heavy sync's
+            // enumerate/syncKart pass (page-derived, authoritative).
+          }
+        }
+      } else {
+        _kiMode = 'garage-pages'; _kiRetryAt = Date.now() + 3600000;   // scoped/partial — re-probe hourly
+        console.log(`[fast] karts-info returned ${recs.length} record(s) vs fleet ${cur.size} — scoped response; falling back to garage pages (re-probe in 1h)`);
+      }
+    } catch (e) {
+      if (++_kiFails >= 3) { _kiMode = 'garage-pages'; _kiRetryAt = Date.now() + 600000; _kiFails = 0;
+        console.log(`[fast] karts-info failing (${(e.message || '').slice(0, 80)}) — falling back to garage pages (re-probe in 10m)`); }
     }
   }
+
+  // ---- fallback: the ~6 garage list-page fetches (site-filtered, on the status session) ----------
+  if (!viaKI) {
+    const uuids = Object.keys(KART_TYPES).filter((u) => (KART_TYPES[u].site || 'sydney') === SITE);
+    const sj = statusJar();
+    const lists = await Promise.all(uuids.map(async (uuid) => {
+      try { const html = await (await rf(`/en/administration/garage/garage?kart_type_uuid=${uuid}`, { jar: sj })).text(); return parseGarageStatuses(html); }
+      catch (e) { return []; }                          // a page that fails this cycle just gets skipped; the next cycle/heavy covers it
+    }));
+    for (let _li = 0; _li < lists.length; _li++) {
+      const pageType = (KART_TYPES[uuids[_li]] && KART_TYPES[uuids[_li]].type) || null;   // the track type this page represents
+      for (const k of lists[_li]) {
+        if (!k.rfId || k.statusCode == null || !cur.has(k.rfId) || seen.has(k.rfId)) continue;
+        seen.add(k.rfId); scanned++;
+        // parseGarageStatuses may expose a note indicator under any of these names; harmless if absent.
+        if (k.hasNote || k.hasNotes || k.noteActive || k.note || k.notes_count > 0) noteFlags.add(k.rfId);
+        const statusChanged = cur.get(k.rfId) !== k.statusCode;
+        const typeChanged = pageType != null && curType.get(k.rfId) !== pageType;   // kart moved to another track type
+        if (!statusChanged && !typeChanged) continue;   // nothing changed this cycle: do not write, do not broadcast
+        const _row = { rf_id: k.rfId, status: k.status, status_code: k.statusCode, fetched_at: now };
+        if (pageType != null) _row.type = pageType;     // land the current track type in the same fast write
+        rows.push(_row);
+      }
+    }
+  }
+
   for (let i = 0; i < rows.length; i += 100) {
     try { await sb('rf_karts?on_conflict=rf_id', { method: 'POST', prefer: 'resolution=merge-duplicates', body: rows.slice(i, i + 100) }); }
     catch (e) { console.error(`[fast] status upsert failed: ${e.message}`); }
   }
   // one tiny row carries the "last polled" timestamp so freshness is tracked without stamping every kart
   try { await sb('rf_sync_state?on_conflict=k', { method: 'POST', prefer: 'resolution=merge-duplicates', body: [{ k: 'last_status', v: now, at: now }] }); } catch (e) {}
-  if (rows.length) console.log(`[fast] ${rows.length} status change(s) of ${scanned} scanned.`);
-  statusFast._noteFlags = noteFlags;                  // hand the note-flags to notesFast (free — already parsed)
+  if (rows.length) console.log(`[fast] ${rows.length} status change(s) of ${scanned} scanned${viaKI ? ' (karts-info)' : ''}.`);
+  statusFast._noteFlags = noteFlags;                  // note-flags only exist on the garage-page path now
   statusFast._sawFlags = noteFlags.size > 0;          // did the parser actually expose note info this cycle?
   return rows.length;
 }
@@ -1335,6 +1404,18 @@ async function main() {
   const idMap = await enumerateKarts();           // Map: rf_id -> { site, type }
   console.log(`Syncing ${idMap.size} karts...`);
   try { await statusFast(); } catch (e) {}        // refresh OK/Damaged up-front so a status flip isn't stuck behind the whole pass
+
+  // TYPE-MOVE REFRESH (write-on-change). The fast status path (karts-info) does NOT write `type`, and the
+  // full per-kart syncKart loop only runs every ~30min (doKartDetails), so an Adult<->Inter track-type move
+  // would otherwise be invisible for up to ~30min. enumerateKarts already knows each kart's CURRENT
+  // page-derived type (which garage page it appeared on) at zero extra RaceFacer cost, so surface moves
+  // here every heavy run (~10min). Write ONLY the karts whose type actually differs -> no broadcast storm.
+  try {
+    const curTypes = new Map(((await sb('rf_karts?select=rf_id,type')) || []).map((r) => [r.rf_id, r.type]));
+    const typeRows = [];
+    for (const [id, meta] of idMap) { if (meta && meta.type && curTypes.has(id) && curTypes.get(id) !== meta.type) typeRows.push({ rf_id: id, type: meta.type }); }
+    if (typeRows.length) { await sb('rf_karts?on_conflict=rf_id', { method: 'POST', prefer: 'resolution=merge-duplicates', body: typeRows }); console.log(`[fast] type-move refresh: ${typeRows.length} kart(s) changed track type`); }
+  } catch (e) { console.log('[fast] type-move refresh skipped:', (e.message || '').slice(0, 80)); }
   // Repairs: incremental most runs (stops at the stable tail), FULL once an hour to catch edits to old
   // repairs deep in the list. The hourly gate uses rf_sync_state so it survives the per-run child spawn.
   let repairsFull = false;
