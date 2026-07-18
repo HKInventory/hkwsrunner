@@ -255,17 +255,26 @@ async function syncSessions(rfJson){
   //                a race last fetched while live stayed stored as in_progress forever (the app hides
   //                anything still "in progress"). The CLOCK — window start + 20 min — is the reliable
   //                signal. We fetch it once more to grab the final roster and flip it to ended.
-  const CLOSED_AFTER_MS = 20 * 60000;   // sessions run ~10-13 min in 10-min slots; 20 min past start = over
+  // A race here is scheduled on a 10-min slot but starts a few minutes late and runs ~13-15 min, so its
+  // real end is ~start+25 min. CLOSED_AFTER is the clock cut-off after which we treat a slot as over.
+  const CLOSED_AFTER_MS = 25 * 60000;
+  const PRE_MS = 3 * 60000;             // start refreshing a slot a few min before its scheduled time
   const live = [], fresh = [], backfill = [];
   for (const s of list){
     if (_doneFinished[s.uuid]) continue;
     const st = (s.status || '').toLowerCase();
-    if (st.includes('progress')){ live.push(s); continue; }
-    if (/finish|complet|closed|\bended?\b|\bdone\b/.test(st)){ backfill.push(s); continue; }   // explicit (other builds)
     const startMs = sydneyStrToMs(s.when);
-    if (startMs && (now - startMs) > CLOSED_AFTER_MS){ backfill.push(s); continue; }            // clock says it's over
+    // ACTIVE WINDOW: a slot whose scheduled time is happening right now. We MUST re-fetch these every
+    // cycle even if the schedule status still reads "not_started", because the detail endpoint is what
+    // reports the live "in_progress" status + kart roster — and the BMS cell logger only records karts
+    // whose rf_sessions row is in_progress. If we don't refresh during the window, a race never lands as
+    // in_progress and its cell data is never logged (the "kart ran but no session data" bug).
+    const inWindow = startMs && now >= (startMs - PRE_MS) && now <= (startMs + CLOSED_AFTER_MS);
+    if (st.includes('progress') || inWindow){ live.push(s); continue; }        // running OR its slot is now
+    if (/finish|complet|closed|\bended?\b|\bdone\b/.test(st)){ backfill.push(s); continue; }
+    if (startMs && (now - startMs) > CLOSED_AFTER_MS){ backfill.push(s); continue; }   // window closed
     if (!_seenOnce[s.uuid]){ fresh.push(s); continue; }
-    // upcoming & already stored -> nothing changes until it starts
+    // upcoming & already stored -> nothing changes until its window opens
   }
   const wanted = live.concat(fresh, backfill).slice(0, 25);
   let wrote = 0, fetched = 0, healed = 0;
@@ -278,14 +287,19 @@ async function syncSessions(rfJson){
     // No detail for a session whose window has closed: stop chasing it so it doesn't re-queue every cycle.
     if (!sd){ if (windowClosed) _doneFinished[s.uuid] = true; continue; }
     const { sess, runRows } = rowsFromDetail(sd, s.uuid, schedStartMs);
-    // "Finished" = an explicit finish word (some builds) OR the scheduled end has passed OR the schedule's
-    // own clock says the window closed. On THIS build only the clock is reliable, so we trust it.
     const stLc = (sess.status || '').toLowerCase();
+    const stillLive = stLc.includes('progress');                                  // RaceFacer says it's running NOW
+    const explicitFinish = /finish|complete|closed|ended|done/i.test(stLc);
     const endPassed = sess.ends_at && Date.parse(sess.ends_at) < (now - 5 * 60000);
-    const finished = /finish|complete|closed|ended|done/i.test(stLc) || endPassed || windowClosed;
-    // Normalize the stored status so the app shows the race: it HIDES anything matching /progress/, and a
-    // finished race on this build often still carries an in_progress (or empty) status. Rewrite to 'ended'.
-    if (finished && (!stLc || stLc.includes('progress'))){ sess.status = 'ended'; healed++; }
+    // Absolute backstop: even a session RaceFacer leaves stuck at in_progress is treated as over this long
+    // after its start, so it can't log BMS or hide from the app forever.
+    const hardOver = schedStartMs && (now - schedStartMs) > (CLOSED_AFTER_MS + 15 * 60000);
+    // Finished = RaceFacer says so, OR it's no longer calling itself live and its clock window has closed,
+    // OR the hard backstop passed. Crucially we do NOT clock-finish a race that RaceFacer still reports as
+    // in_progress before the backstop — that would flip it out of in_progress mid-race and cut BMS logging.
+    const finished = explicitFinish || (!stillLive && (endPassed || windowClosed)) || hardOver;
+    // Normalize the stored status so the app shows a finished race (it hides anything matching /progress/).
+    if (finished && (!stLc || stillLive)){ sess.status = 'ended'; healed++; }
     const h = sha(JSON.stringify(sess) + JSON.stringify(runRows));
     if (_sessHash[s.uuid] === h){ if (finished) _doneFinished[s.uuid] = true; continue; }
     _sessHash[s.uuid] = h;
