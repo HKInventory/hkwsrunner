@@ -364,6 +364,22 @@ async function sb(path, { method = 'GET', body, prefer, headers } = {}) {
 }
 const dmy = (d) => { const [a, b, c] = (d || '').split('.'); return c ? `${c}-${b}-${a}` : null; };
 
+// Page through ALL rows of a Supabase select via Range headers — PostgREST caps a single response at
+// 1000 rows (see the repairs fingerprint pre-read above for the same fix, needed for the same reason).
+// rf_kart_notes' full history already exceeds that fleet-wide, so an unpaged read would silently drop
+// rows and reintroduce false "changed" flags for whatever fell past row 1000.
+async function sbAll(path) {
+  const out = [];
+  const PAGE = 1000;
+  for (let from = 0; ; from += PAGE) {
+    const chunk = await sb(path, { headers: { Range: `${from}-${from + PAGE - 1}`, 'Range-Unit': 'items' } });
+    if (!chunk || !chunk.length) break;
+    out.push(...chunk);
+    if (chunk.length < PAGE) break;
+  }
+  return out;
+}
+
 // Write a diagnostic row to rf_debug (created by rf_debug.sql). Best-effort — a Render Background
 // Worker has no public URL, so this table is the only place we can surface a page dump for Harvey.
 // Bounded payload; the table self-trims to the newest 20 rows.
@@ -888,26 +904,23 @@ async function notesFromKartNotesPage(){
   if (!idx.length) return null;
 
   // 1) Backfill kart_note_id onto active notes. Two passes:
-  //    a) rows with NO id yet — match EXACT text, or (if that misses) "this kart has exactly one open note
-  //       on the page and exactly one un-backfilled row" — unambiguous without needing text to agree at all.
-  //       We deliberately do NOT fall back to a prefix/substring match: this fleet has real near-duplicate
-  //       notes on the SAME kart (e.g. "Slowing down to speed 1" and "...randomly" as two separate active
-  //       notes), and a prefix match silently picked the wrong one — an id that then could never
-  //       self-correct, because backfill only ever touched rows where the id was still null.
+  //    a) rows with NO id yet — match EXACT text, or (if that misses) "this kart has exactly one
+  //       UN-CLAIMED page note and exactly one un-backfilled row" — unambiguous without needing text to
+  //       agree at all. We deliberately do NOT fall back to a prefix/substring match: this fleet has real
+  //       near-duplicate notes on the SAME kart (e.g. "Slowing down to speed 1" and "...randomly" as two
+  //       separate active notes), and a prefix match silently picked the wrong one.
+  //       Candidates are NOT filtered by the page's `archived` flag: a real diagnostic dump showed karts
+  //       with 15-44 rows ALL marked archived:false (obviously mostly historical/resolved notes, not
+  //       simultaneously-open ones) — that flag isn't a reliable "still open" signal on this markup.
+  //       Instead a candidate is simply any page row for the kart not already claimed by another active
+  //       DB row for that same kart.
   //    b) rows that already HAVE an id — verify it, but ONLY on a KART mismatch (this id now belongs to a
   //       note on a DIFFERENT kart on RaceFacer — real proof of a stale/reassigned id). Do NOT clear on a
   //       TEXT mismatch alone: page.note comes from the Kart Notes page's `data-message` attribute while
   //       the DB's note came from the per-kart endpoint's rendered table cell (parseKartNotesTableRows vs
   //       parseKartNotes in racefacer-parse.js) — two independently-formatted sources for the same note
-  //       (attribute truncation/escaping vs cell text) that are NOT guaranteed to match exactly even when
-  //       they're the same note. Treating that drift as "bad assignment" was clearing valid ids every
-  //       cycle; on multi-note karts the singleton fallback below can't re-resolve them, so the id was lost
-  //       for good — which is what kept rf_kart_note_id backfilled-then-reset in a non-converging loop and
-  //       silently broke app->RaceFacer note deletes (rfDeleteNote needs this id to clear the Kart Notes
-  //       list entry).
+  //       that are NOT guaranteed to match exactly even when they're the same note.
   try {
-    const openByKart = new Map();
-    for (const b of idx) { if (b.archived !== false || b.rfKartId == null) continue; if (!openByKart.has(b.rfKartId)) openByKart.set(b.rfKartId, []); openByKart.get(b.rfKartId).push(b); }
     const byId = new Map(); for (const b of idx) if (b.kartNoteId != null) byId.set(Number(b.kartNoteId), b);
 
     // (b) verify + self-correct existing ids first, so a freshly-cleared bad id gets fixed in this same pass.
@@ -922,6 +935,19 @@ async function notesFromKartNotesPage(){
       for (const id of toClear){ try { await sb(`rf_kart_notes?id=eq.${id}`, { method:'PATCH', prefer:'return=minimal', body:{ rf_kart_note_id: null } }); } catch (e) {} }
     }
 
+    // Candidates per kart = page rows for that kart not already claimed by another active DB row for the
+    // same kart (post-clear) — no archived/open filtering, see note above.
+    const claimedByKart = new Map();
+    for (const n of withId){ if (toClear.includes(n.id)) continue; if (!claimedByKart.has(n.rf_kart_id)) claimedByKart.set(n.rf_kart_id, new Set()); claimedByKart.get(n.rf_kart_id).add(Number(n.rf_kart_note_id)); }
+    const candByKart = new Map();
+    for (const b of idx){
+      if (b.rfKartId == null || b.kartNoteId == null) continue;
+      const claimed = claimedByKart.get(b.rfKartId);
+      if (claimed && claimed.has(b.kartNoteId)) continue;
+      if (!candByKart.has(b.rfKartId)) candByKart.set(b.rfKartId, []);
+      candByKart.get(b.rfKartId).push(b);
+    }
+
     // (a) resolve rows with no id (includes any just cleared above).
     const need = (await sb('rf_kart_notes?active=eq.true&rf_kart_note_id=is.null&select=id,rf_kart_id,note')) || [];
     const needByKart = new Map();
@@ -929,7 +955,7 @@ async function notesFromKartNotesPage(){
     for (const n of need){
       let m = idx.find((b) => Number(b.rfKartId) === Number(n.rf_kart_id) && _noteMatch(b.note, n.note));
       if (!m){
-        const cands = openByKart.get(n.rf_kart_id);
+        const cands = candByKart.get(n.rf_kart_id);
         const needSame = needByKart.get(n.rf_kart_id);
         if (cands && cands.length === 1 && needSame && needSame.length === 1) m = cands[0];   // unambiguous single-note kart
       }
@@ -937,25 +963,42 @@ async function notesFromKartNotesPage(){
     }
   } catch (e) {}
 
-  // 2) Diff. IDENTITY-based (rf_kart_note_id / kartNoteId) is now the primary comparison — it's immune to
-  //    the page vs DB representing the same note's TEXT slightly differently (entities, trimming,
-  //    truncation), which is what made the old text-keyed diff flag the same ~148 karts every single
-  //    cycle without ever converging. Rows still lacking an id (pre-backfill, or the rare multi-note kart
-  //    the single-candidate fallback above can't disambiguate) fall back to the old text compare — but
-  //    that set should now be small and shrinking, not the whole fleet.
-  const open = idx.filter((b) => b.archived === false);
-  let dbActive = [];
-  try { dbActive = (await sb('rf_kart_notes?active=eq.true&select=rf_kart_id,note,rf_kart_note_id')) || []; } catch (e){ return 0; }
-  const dbById = new Map(), dbNoId = [];
-  for (const n of dbActive){ if (n.rf_kart_note_id != null) dbById.set(Number(n.rf_kart_note_id), n); else dbNoId.push(n); }
-  const presentIds = new Set(idx.filter((b) => b.archived !== true && b.kartNoteId != null).map((b) => Number(b.kartNoteId)));
+  // 2) Diff. Per kart: is every note the page currently shows ALREADY accounted for in rf_kart_notes
+  //    (matched by rf_kart_note_id when backfilled, else by exact text)? If yes, this kart's history is
+  //    fully known and doesn't need re-fetching just because old notes are still listed there. A page row
+  //    matching NEITHER an existing id NOR existing text for that kart is genuinely new -> fetch.
+  //    Deletes: a DB row that HAS an id now completely absent from the fresh page listing -> fetch to
+  //    prune (rows never backfilled fall back to a text-presence check).
+  //
+  //    Deliberately NOT using the page's `archived` flag anywhere here — see (1) above. The old
+  //    archived-filtered version flagged the same ~144 karts every cycle forever, because it was
+  //    comparing "everything not archived" (in practice: nearly the whole fleet-wide history, since the
+  //    flag rarely if ever reads true on this markup) against the DB's much smaller active set.
+  let dbAll = [];
+  try { dbAll = await sbAll('rf_kart_notes?select=rf_kart_id,note,rf_kart_note_id'); } catch (e){ return 0; }
+  const dbIdsByKart = new Map(), dbTextByKart = new Map();
+  for (const n of dbAll){
+    const k = Number(n.rf_kart_id);
+    if (n.rf_kart_note_id != null){ if (!dbIdsByKart.has(k)) dbIdsByKart.set(k, new Set()); dbIdsByKart.get(k).add(Number(n.rf_kart_note_id)); }
+    if (!dbTextByKart.has(k)) dbTextByKart.set(k, new Set());
+    dbTextByKart.get(k).add(_normNote(n.note));
+  }
   const changed = new Set();
-  for (const b of open){ if (b.kartNoteId != null && !dbById.has(Number(b.kartNoteId))) changed.add(Number(b.rfKartId)); }         // new OPEN note (by id)
-  for (const [id, n] of dbById){ if (!presentIds.has(id)) changed.add(Number(n.rf_kart_id)); }                                     // gone from RF (by id)
-  if (dbNoId.length){   // legacy/ambiguous rows only — text compare, but this set should be small and shrink as backfill runs
-    const keyOf = (kart, note) => `${kart}|${_normNote(note)}`;
-    const presentKeys = new Set(idx.filter((b) => b.archived !== true).map((b) => keyOf(b.rfKartId, b.note)));
-    for (const n of dbNoId){ if (!presentKeys.has(keyOf(n.rf_kart_id, n.note))) changed.add(Number(n.rf_kart_id)); }
+  for (const b of idx){   // ADDS: a page row not already known by id or by text for that kart
+    const k = Number(b.rfKartId);
+    const knownIds = dbIdsByKart.get(k);
+    if (b.kartNoteId != null && knownIds && knownIds.has(Number(b.kartNoteId))) continue;
+    const knownText = dbTextByKart.get(k);
+    if (knownText && knownText.has(_normNote(b.note))) continue;
+    changed.add(k);
+  }
+  const presentIds = new Set(idx.filter((b) => b.kartNoteId != null).map((b) => Number(b.kartNoteId)));
+  for (const [k, ids2] of dbIdsByKart){ for (const id of ids2){ if (!presentIds.has(id)) { changed.add(k); break; } } }   // DELETES: a known id vanished from RF entirely
+  let dbNoId = [];
+  try { dbNoId = (await sb('rf_kart_notes?active=eq.true&rf_kart_note_id=is.null&select=rf_kart_id,note')) || []; } catch (e) {}
+  if (dbNoId.length){   // DELETES for un-backfilled rows — text-presence check, small/shrinking as backfill runs
+    const presentKeys = new Set(idx.map((b) => `${b.rfKartId}|${_normNote(b.note)}`));
+    for (const n of dbNoId){ if (!presentKeys.has(`${n.rf_kart_id}|${_normNote(n.note)}`)) changed.add(Number(n.rf_kart_id)); }
   }
   let ids = [...changed].filter((x) => x != null && !Number.isNaN(x));
   if (!_knBaselined){
@@ -968,8 +1011,10 @@ async function notesFromKartNotesPage(){
     console.log(`[notes] diff anomaly: ${ids.length} kart(s) flagged (dbNoId=${dbNoId.length}) — capping to protect bandwidth`);
     if (++_knAnomalyStreak >= 3 && !_knAnomalyDiag){
       _knAnomalyDiag = true;
+      let dbActiveDebug = [];
+      try { dbActiveDebug = (await sb('rf_kart_notes?active=eq.true&select=rf_kart_id,note,rf_kart_note_id')) || []; } catch (e) {}
       const sample = ids.slice(0, 3).map((kartId) => {
-        const dbRow = dbActive.find((n) => Number(n.rf_kart_id) === kartId);
+        const dbRow = dbActiveDebug.find((n) => Number(n.rf_kart_id) === kartId);
         const pageRows = idx.filter((b) => Number(b.rfKartId) === kartId);
         return { kartId, db: dbRow ? { note: dbRow.note, rf_kart_note_id: dbRow.rf_kart_note_id } : null,
                   page: pageRows.map((b) => ({ kartNoteId: b.kartNoteId, note: b.note, archived: b.archived })) };
