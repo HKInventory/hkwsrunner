@@ -978,14 +978,19 @@ async function notesFromKartNotesPage(){
     const cur = currentIdsByKart.get(k);
     for (const id of prevIds) { if (!cur || !cur.has(id)) { changed.add(k); break; } }   // DELETE: a previously-seen id is gone
   }
-  // Un-backfilled active rows can't be tracked by id at all yet — light text-presence delete check, small
-  // and shrinking as (1)'s backfill runs.
+  // NOTE: un-backfilled active rows (rf_kart_note_id still null) are deliberately NOT independently
+  // diffed here by text. An earlier version of this function did that as a "delete" fallback for rows
+  // that can't be tracked by id yet — comparing DB text (from the per-kart endpoint) against page text
+  // (from the data-message attribute) fresh, every cycle, with no memory. That's the exact same fragile
+  // cross-source text join (1) above already had to work around, and it bypasses the snapshot entirely,
+  // so it can never converge: a live sample showed a DB-active note with NO matching text anywhere on
+  // that kart's page rows, flagged "changed" identically cycle after cycle. It's not actually needed —
+  // the snapshot above already catches a genuine delete for ANY page row it has ever seen (regardless of
+  // whether that specific DB row got backfilled with an id), because it tracks the page's kartNoteId set
+  // directly, not through the DB. A note that somehow never appears on the global page at all (so the
+  // snapshot never sees it to lose it) still gets caught by the ~15min full sweep (sweepNotesAll).
   let dbNoId = [];
-  try { dbNoId = (await sb('rf_kart_notes?active=eq.true&rf_kart_note_id=is.null&select=rf_kart_id,note')) || []; } catch (e) {}
-  if (dbNoId.length){
-    const presentKeys = new Set(idx.map((b) => `${b.rfKartId}|${_normNote(b.note)}`));
-    for (const n of dbNoId){ if (!presentKeys.has(`${n.rf_kart_id}|${_normNote(n.note)}`)) changed.add(Number(n.rf_kart_id)); }
-  }
+  try { dbNoId = (await sb('rf_kart_notes?active=eq.true&rf_kart_note_id=is.null&select=rf_kart_id')) || []; } catch (e) {}
   _knSeenIdsByKart = currentIdsByKart;   // commit now, regardless of what gets fetched below — see note above
   let ids = [...changed].filter((x) => x != null && !Number.isNaN(x));
   if (!_knBaselined){
