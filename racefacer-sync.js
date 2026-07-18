@@ -1282,7 +1282,7 @@ async function sweepNotesAll({ concurrency = 8 } = {}) {
 //   • repeated fetch errors back off to the garage pages and re-probe later.
 // STATUS_VIA_KARTS_INFO=0 disables the new path entirely.
 let _kiMode = null;            // null = unprobed, 'karts-info' = proven, 'garage-pages' = fallback
-let _kiFails = 0, _kiRetryAt = 0, _kiValidated = false;
+let _kiFails = 0, _kiRetryAt = 0, _kiValidated = false, _kiRawDumped = false;
 async function statusFast() {
   // WRITE-ON-CHANGE: read each kart's CURRENT status_code, and only write back the karts whose
   // status actually flipped this cycle. Re-writing all ~190 karts every cycle (even unchanged)
@@ -1311,16 +1311,31 @@ async function statusFast() {
       const reps = [...repByType.values()];
       const pool = statusPool();
       const t0req = Date.now();
+      // Replicate the pusher's PROVEN karts-info call exactly (rf_push_repairs.js:557): it needs the
+      // Referer + Origin + Accept:application/json headers or RaceFacer bounces it to a redirect and the
+      // body isn't JSON — which is why an earlier header-less attempt got 0 records in 428ms.
+      const kiHeaders = { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest', 'Origin': RF_BASE, 'Referer': `${RF_BASE}/en/administration/settings/karts` };
+      let _rawSample = '';
       const responses = await Promise.all(reps.map(async (rep, i) => {
-        try { return await rfJson(`/ajax/kart/karts-info?kart_id=${rep}`, 2, pool[i % pool.length]); }
-        catch (e) { return null; }
+        try {
+          const r = await rf(`/ajax/kart/karts-info?kart_id=${rep}`, { jar: pool[i % pool.length], headers: kiHeaders });
+          if (r.status === 302 || r.status >= 400) { if (!_rawSample) _rawSample = `HTTP ${r.status} -> ${r.headers.get('location') || ''}`; return null; }
+          const text = await r.text();
+          try { return JSON.parse(text); } catch { if (!_rawSample) _rawSample = text.slice(0, 300); return null; }
+        } catch (e) { return null; }
       }));
       const kiMs = Date.now() - t0req;
       const recs = [], seenRec = new Set();
-      const collect = (arr) => { for (const x of arr) if (x && x.id != null && x.kart_status_id != null && !seenRec.has(Number(x.id))) { seenRec.add(Number(x.id)); recs.push(x); } };
+      // require id; kart_status_id is what we need for status (the pusher confirms records carry it).
+      const collect = (arr, gk) => { for (const x of arr) if (x && x.id != null && !seenRec.has(Number(x.id))) { seenRec.add(Number(x.id)); recs.push(x); } };
       for (const j of responses) { if (!j) continue;
-        const groups = (j.kart_names || j.karts || j.karts_info); if (groups && typeof groups === 'object') for (const g in groups) if (Array.isArray(groups[g])) collect(groups[g]);
+        const groups = (j.kart_names || j.karts || j.karts_info); if (groups && typeof groups === 'object') for (const g in groups) if (Array.isArray(groups[g])) collect(groups[g], g);
         if (Array.isArray(j)) collect(j);
+      }
+      // one-time capture of the raw response if we still parsed nothing, so the exact shape is visible
+      if (!recs.length && !_kiRawDumped) { _kiRawDumped = true;
+        console.log(`[fast] karts-info parsed 0 recs; raw sample: ${(_rawSample || '(empty/none)').replace(/\s+/g, ' ').slice(0, 200)}`);
+        try { await rfDebug('karts_info_status', 0, `karts-info returned no parseable records via status session (reps=${reps.length})`, _rawSample || '(no response)'); } catch (e) {}
       }
       if (recs.length >= cur.size * 0.6) {
         // one-time semantic validation: kart_status_id must broadly AGREE with the DB's current
