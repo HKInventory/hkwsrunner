@@ -124,6 +124,22 @@ function parseLapMins(runs){
   return m || 10;   // slot_time on the page is 10 min
 }
 
+// "2026-07-14 17:00:00" (or with T) is venue-local Sydney wall time -> UTC ms. Returns null if unparseable.
+// Shared by rowsFromDetail (to stamp scheduled_at) and syncSessions (to tell when a session's window has
+// clearly closed, which is the ONLY reliable finish signal on this RaceFacer build — its status string
+// never contains a "finished" word).
+function sydneyStrToMs(str){
+  const m = String(str || '').match(/(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?/);
+  if (!m) return null;
+  const guess = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0));
+  for (const offH of [10, 11, 9]){   // AEST/AEDT candidates
+    const t = guess - offH * 3600000;
+    const back = new Intl.DateTimeFormat('en-CA', { timeZone: 'Australia/Sydney', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(t));
+    if (back === `${m[1]}-${m[2]}-${m[3]}, ${m[4]}:${m[5]}`) return t;
+  }
+  return guess - 10 * 3600000;   // fall back to AEST if no offset rendered an exact match
+}
+
 async function fetchDetail(rfJson, uuid, subTrack){
   // The schedule endpoint returns every session under every sub_track_id, so a session's "own"
   // sub_track_id from the schedule can be wrong — and the detail endpoint returns 0 runs when queried
@@ -150,25 +166,18 @@ async function fetchDetail(rfJson, uuid, subTrack){
   return fallback;
 }
 
-function rowsFromDetail(sd, uuid){
+function rowsFromDetail(sd, uuid, fallbackStartMs){
   const runsIn = (sd.runs && (sd.runs.data || sd.runs)) || [];
   const runs = Array.isArray(runsIn) ? runsIn : [];
-  const startStr = sd.scheduled_time_string || sd.scheduled_time || '';
-  // "2026-07-14 17:00:00" is venue-local (Sydney) — attach the offset via Intl round-trip.
+  // Prefer the detail response's own time; fall back to the schedule's `when` (fallbackStartMs) so a
+  // detail response that omits the time still gets a scheduled_at — the app filters on `.gte(scheduled_at)`
+  // and silently drops any row whose scheduled_at is null, which would hide the session entirely.
+  let startMs = sydneyStrToMs(sd.scheduled_time_string || sd.scheduled_time || '');
+  if (startMs == null && fallbackStartMs != null) startMs = fallbackStartMs;
   let scheduled_at = null, ends_at = null;
-  if (startStr){
-    const m = String(startStr).match(/(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?/);
-    if (m){
-      // Interpret as Australia/Sydney wall time: find the UTC instant whose Sydney rendering matches.
-      const guess = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0));
-      for (const offH of [10, 11, 9]){   // AEST/AEDT candidates
-        const t = guess - offH * 3600000;
-        const back = new Intl.DateTimeFormat('en-CA', { timeZone: 'Australia/Sydney', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(t));
-        if (back === `${m[1]}-${m[2]}-${m[3]}, ${m[4]}:${m[5]}`){ scheduled_at = new Date(t).toISOString(); break; }
-      }
-      if (!scheduled_at) scheduled_at = new Date(guess - 10 * 3600000).toISOString();
-      ends_at = new Date(Date.parse(scheduled_at) + (parseLapMins(runs) + 3) * 60000).toISOString();   // +3 min buffer
-    }
+  if (startMs != null){
+    scheduled_at = new Date(startMs).toISOString();
+    ends_at = new Date(startMs + (parseLapMins(runs) + 3) * 60000).toISOString();   // +3 min buffer
   }
   const sess = {
     uuid,
@@ -237,40 +246,47 @@ async function syncSessions(rfJson){
   const list = await fetchSchedule(rfJson, date);
   if (!list.length) return;
   const now = Date.now();
-  // Which sessions deserve a detail fetch THIS cycle — kept minimal so we're not hammering RaceFacer:
-  //   • IN-PROGRESS sessions -> always (their karts/laps change live).
-  //   • Sessions we've never fetched -> once (to store label/time; upcoming slots have no karts yet).
-  //   • Upcoming sessions we've already stored -> SKIP until they go in-progress. Re-fetching every 20s
-  //     did nothing (no karts assigned until a session starts) and was the bulk of the request storm.
-  //   • Finished -> never (cached in _doneFinished).
-  const wanted = list.filter(s => {
-    if (_doneFinished[s.uuid]) return false;      // already captured its FINAL (finished) state
+  // Which sessions to detail-fetch, in PRIORITY order so the fetch cap never starves live races:
+  //   live      -> in-progress: roster/laps change every cycle.
+  //   fresh     -> never seen: fetch once to store its label/time (upcoming slots have no karts yet).
+  //   backfill  -> a session whose window has clearly CLOSED but we haven't captured as finished. This is
+  //                the fix for the session-data-empty bug: this RaceFacer build's finished status string
+  //                does NOT contain "finished/complete/ended", so the old status-word test never fired and
+  //                a race last fetched while live stayed stored as in_progress forever (the app hides
+  //                anything still "in progress"). The CLOCK — window start + 20 min — is the reliable
+  //                signal. We fetch it once more to grab the final roster and flip it to ended.
+  const CLOSED_AFTER_MS = 20 * 60000;   // sessions run ~10-13 min in 10-min slots; 20 min past start = over
+  const live = [], fresh = [], backfill = [];
+  for (const s of list){
+    if (_doneFinished[s.uuid]) continue;
     const st = (s.status || '').toLowerCase();
-    if (st.includes('progress')) return true;                                  // live -> refresh every cycle
-    // JUST FINISHED -> fetch once more to store status='finished' + final karts/laps. Without this, a
-    // race that finished WHILE the worker was up stayed stored as its last in_progress fetch, so the app's
-    // "finished sessions" screen never saw it (the session-data-empty bug). _doneFinished then stops it.
-    if (/finish|complet|closed|\bended?\b|\bdone\b/.test(st)) return true;
-    if (!_seenOnce[s.uuid]) return true;          // first sighting -> fetch once to store its label/time
-    return false;                                  // upcoming & already stored -> nothing changes until it starts
-  }).slice(0, 25);
-  let wrote = 0, fetched = 0;
+    if (st.includes('progress')){ live.push(s); continue; }
+    if (/finish|complet|closed|\bended?\b|\bdone\b/.test(st)){ backfill.push(s); continue; }   // explicit (other builds)
+    const startMs = sydneyStrToMs(s.when);
+    if (startMs && (now - startMs) > CLOSED_AFTER_MS){ backfill.push(s); continue; }            // clock says it's over
+    if (!_seenOnce[s.uuid]){ fresh.push(s); continue; }
+    // upcoming & already stored -> nothing changes until it starts
+  }
+  const wanted = live.concat(fresh, backfill).slice(0, 25);
+  let wrote = 0, fetched = 0, healed = 0;
   for (const s of wanted){
+    const schedStartMs = sydneyStrToMs(s.when);
+    const windowClosed = schedStartMs && (now - schedStartMs) > CLOSED_AFTER_MS;
     const sd = await fetchDetail(rfJson, s.uuid, s.sub_track_id);
     _seenOnce[s.uuid] = true;   // mark attempted so an upcoming slot isn't re-fetched every cycle
     fetched++;
-    if (!sd) continue;
-    const { sess, runRows } = rowsFromDetail(sd, s.uuid);
-    const h = sha(JSON.stringify(sess) + JSON.stringify(runRows));
-    // "Finished" = RaceFacer says so OR the scheduled end time has passed and it's no longer live.
-    // The status-word check alone misses RaceFacer's real finished string, so past races never got
-    // marked done — they kept occupying the per-cycle fetch window and starved later sessions (some
-    // finished/chequered races then never landed). The time fallback fixes that. We deliberately do
-    // NOT mark a session done while it's still in_progress past its end time (a race that ran long)
-    // so we keep syncing until its status actually clears.
+    // No detail for a session whose window has closed: stop chasing it so it doesn't re-queue every cycle.
+    if (!sd){ if (windowClosed) _doneFinished[s.uuid] = true; continue; }
+    const { sess, runRows } = rowsFromDetail(sd, s.uuid, schedStartMs);
+    // "Finished" = an explicit finish word (some builds) OR the scheduled end has passed OR the schedule's
+    // own clock says the window closed. On THIS build only the clock is reliable, so we trust it.
     const stLc = (sess.status || '').toLowerCase();
-    const endPassed = sess.ends_at && Date.parse(sess.ends_at) < (Date.now() - 5 * 60000);
-    const finished = /finish|complete|closed|ended|done/i.test(stLc) || (endPassed && !stLc.includes('progress'));
+    const endPassed = sess.ends_at && Date.parse(sess.ends_at) < (now - 5 * 60000);
+    const finished = /finish|complete|closed|ended|done/i.test(stLc) || endPassed || windowClosed;
+    // Normalize the stored status so the app shows the race: it HIDES anything matching /progress/, and a
+    // finished race on this build often still carries an in_progress (or empty) status. Rewrite to 'ended'.
+    if (finished && (!stLc || stLc.includes('progress'))){ sess.status = 'ended'; healed++; }
+    const h = sha(JSON.stringify(sess) + JSON.stringify(runRows));
     if (_sessHash[s.uuid] === h){ if (finished) _doneFinished[s.uuid] = true; continue; }
     _sessHash[s.uuid] = h;
     const { error: e1 } = await supa.from('rf_sessions').upsert(sess, { onConflict: 'uuid' });
@@ -282,7 +298,7 @@ async function syncSessions(rfJson){
     if (finished) _doneFinished[s.uuid] = true;
     wrote++;
   }
-  if (wrote || fetched) console.log(`[sessions] ${wrote} written / ${fetched} detail-fetched (${list.length} on today's schedule; only live + first-seen are fetched)`);
+  if (wrote || fetched) console.log(`[sessions] ${wrote} written / ${fetched} detail-fetched / ${healed} healed→ended (${list.length} on today's schedule; live=${live.length} fresh=${fresh.length} backfill=${backfill.length})`);
   // Diagnostic: which track_configuration values are actually present in what we fetched today.
   // If this only ever shows Intermediate, Adult sessions aren't coming back from RaceFacer at all
   // (schedule/detail endpoint or sub_track_id issue), not an app-display problem.
