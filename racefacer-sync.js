@@ -763,7 +763,12 @@ let _notifDiagDone = false;
 let _goneCursor = 0;
 let _knPageDiagDone = false;
 const _normNote = (s) => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
-function _noteMatch(a, b){ a = _normNote(a); b = _normNote(b); if (!a || !b) return false; if (a === b) return true; const n = Math.min(a.length, b.length, 30); return n >= 6 && a.slice(0, n) === b.slice(0, n); }   // data-message on the page can be truncated -> prefix match
+// EXACT match only (after whitespace/case normalization) — deliberately NOT a prefix/substring match.
+// This fleet has real near-duplicate notes on the same kart (e.g. "Slowing down to speed 1" and
+// "...randomly" as two separate active notes); a prefix match treats the shorter one as matching the
+// longer one, which silently assigns the WRONG kart_note_id. When text doesn't match exactly, the
+// single-candidate-per-kart fallback (in the caller) is the only other thing allowed to resolve it.
+function _noteMatch(a, b){ a = _normNote(a); b = _normNote(b); return !!a && !!b && a === b; }
 
 // One GET, parsed as JSON if possible, else null (no retry/throw — for probing candidate endpoints).
 async function rfMaybeJson(path){ try { const t = await (await rf(path, { ajax:true })).text(); return JSON.parse(t); } catch { return null; } }
@@ -882,16 +887,35 @@ async function notesFromKartNotesPage(){
   const idx = (await getKartNoteIndex()).filter((b) => b.rfKartId != null && b.note != null);
   if (!idx.length) return null;
 
-  // 1) Backfill kart_note_id onto active notes that don't have it yet. Try an exact/prefix text match
-  //    first; if that misses (page vs DB can represent the same note text slightly differently — HTML
-  //    entities, trimming, truncation — which was silently starving the ID-based diff below), fall back
-  //    to "this kart has exactly one open note on the page and exactly one un-backfilled active note in
-  //    the DB" — an unambiguous match that doesn't depend on text agreeing at all. Most karts carry a
-  //    single note, so this alone should backfill the large majority even when text never matches.
+  // 1) Backfill kart_note_id onto active notes. Two passes:
+  //    a) rows with NO id yet — match EXACT text, or (if that misses) "this kart has exactly one open note
+  //       on the page and exactly one un-backfilled row" — unambiguous without needing text to agree at all.
+  //       We deliberately do NOT fall back to a prefix/substring match: this fleet has real near-duplicate
+  //       notes on the SAME kart (e.g. "Slowing down to speed 1" and "...randomly" as two separate active
+  //       notes), and a prefix match silently picked the wrong one — an id that then could never
+  //       self-correct, because backfill only ever touched rows where the id was still null.
+  //    b) rows that already HAVE an id — verify it: if the page's note at that id doesn't match the DB's
+  //       stored text at all (proof of a bad prior assignment, like a-b above), clear it back to null so
+  //       pass (a) can re-resolve it correctly on this same run.
   try {
-    const need = (await sb('rf_kart_notes?active=eq.true&rf_kart_note_id=is.null&select=id,rf_kart_id,note')) || [];
     const openByKart = new Map();
     for (const b of idx) { if (b.archived !== false || b.rfKartId == null) continue; if (!openByKart.has(b.rfKartId)) openByKart.set(b.rfKartId, []); openByKart.get(b.rfKartId).push(b); }
+    const byId = new Map(); for (const b of idx) if (b.kartNoteId != null) byId.set(Number(b.kartNoteId), b);
+
+    // (b) verify + self-correct existing ids first, so a freshly-cleared bad id gets fixed in this same pass.
+    const withId = (await sb('rf_kart_notes?active=eq.true&rf_kart_note_id=not.is.null&select=id,rf_kart_id,note,rf_kart_note_id')) || [];
+    const toClear = [];
+    for (const n of withId){
+      const page = byId.get(Number(n.rf_kart_note_id));
+      if (page && Number(page.rfKartId) === Number(n.rf_kart_id) && !_noteMatch(page.note, n.note)) toClear.push(n.id);
+    }
+    if (toClear.length){
+      console.log(`[notes] backfill: clearing ${toClear.length} rf_kart_note_id(s) that point to a mismatched note (self-correcting a prior bad assignment)`);
+      for (const id of toClear){ try { await sb(`rf_kart_notes?id=eq.${id}`, { method:'PATCH', prefer:'return=minimal', body:{ rf_kart_note_id: null } }); } catch (e) {} }
+    }
+
+    // (a) resolve rows with no id (includes any just cleared above).
+    const need = (await sb('rf_kart_notes?active=eq.true&rf_kart_note_id=is.null&select=id,rf_kart_id,note')) || [];
     const needByKart = new Map();
     for (const n of need) { if (!needByKart.has(n.rf_kart_id)) needByKart.set(n.rf_kart_id, []); needByKart.get(n.rf_kart_id).push(n); }
     for (const n of need){

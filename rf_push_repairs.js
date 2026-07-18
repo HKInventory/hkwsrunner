@@ -410,9 +410,12 @@ async function rfDeleteNote(row){
       if (nid == null || nid === '') {
         const dj = await rfAjaxJson(`/ajax/garage/kart-details?id=${kartId}`);
         const active = parseActiveNotes((dj && dj.html) || '');
-        const m = active.find((a) => _normNote(a.note) === want) || (want ? active.find((a) => _normNote(a.note).includes(want.slice(0, 40))) : null);
+        // Exact match, or "only one active note on this kart" — see the kart_note_id fix below for why a
+        // loose substring match is unsafe (near-duplicate notes on the same kart are common here).
+        const m = active.find((a) => _normNote(a.note) === want) || (active.length === 1 ? active[0] : null);
         if (m && m.notifId != null) nid = m.notifId;
-        else if (!active.length || !active.some((a) => a.notifId != null)) { try { await rfDebug('note_delete_html', kartId, `kart-details active-notes: could not read notification_id (note "${String(row.note||'').slice(0,60)}")`, (dj && dj.html) || ''); } catch (e) {} }
+        else if (active.length > 1) { try { await rfDebug('note_delete_ambiguous', kartId, `${active.length} active note(s) for kart ${kartId}, none matched "${String(row.note||'').slice(0,60)}" exactly — refusing to guess`, JSON.stringify(active)); } catch (e) {} }
+        else if (!active.length) { try { await rfDebug('note_delete_html', kartId, `kart-details active-notes: could not read notification_id (note "${String(row.note||'').slice(0,60)}")`, (dj && dj.html) || ''); } catch (e) {} }
       }
       if (knid == null) {
         // Resolve kart_note_id via the sync module's fleet note index (tries RaceFacer's notes-list JSON
@@ -420,11 +423,13 @@ async function rfDeleteNote(row){
         let idx = [];
         try { const s = require('./racefacer-sync'); if (typeof s.getKartNoteIndex === 'function') idx = await s.getKartNoteIndex(); } catch (e) {}
         const mine = idx.filter((b) => b.rfKartId == null || Number(b.rfKartId) === Number(kartId));
-        let m = mine.find((b) => _normNote(b.note) === want)
-             || (want ? mine.find((b) => b.note && (_normNote(b.note).includes(want.slice(0, 30)) || want.includes(_normNote(b.note).slice(0, 30)))) : null)
-             || (mine.length === 1 ? mine[0] : null)
-             || idx.find((b) => _normNote(b.note) === want) || null;
+        // EXACT match only, or "this kart has exactly one open note" — no substring/prefix fallback. A
+        // kart very often carries near-duplicate notes (e.g. "Slowing down to speed 1" AND "...randomly"
+        // as two SEPARATE active notes) and a loose substring match can silently pick the WRONG one,
+        // which would delete the wrong note on RaceFacer. Better to resolve nothing than resolve wrong.
+        let m = mine.find((b) => _normNote(b.note) === want) || (mine.length === 1 ? mine[0] : null);
         if (m && m.kartNoteId != null) knid = m.kartNoteId;
+        else if (mine.length > 1) { try { await rfDebug('note_delete_ambiguous', kartId, `${mine.length} candidate note(s) for kart ${kartId}, none matched "${String(row.note||'').slice(0,60)}" exactly — refusing to guess`, JSON.stringify(mine)); } catch (e) {} }
         else { try { await rfDebug('note_delete_html', kartId, `no kart_note_id for kart ${kartId} note "${String(row.note || '').slice(0, 60)}" (${idx.length} indexed)`, ''); } catch (e) {} }
       }
     } catch (e) { console.log(`[rf-push] note delete #${row.id}: live id lookup failed: ${e.message}`); }
