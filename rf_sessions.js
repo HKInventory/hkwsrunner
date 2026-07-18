@@ -252,6 +252,24 @@ async function syncSessions(rfJson){
   const list = await fetchSchedule(rfJson, date);
   if (!list.length) return;
   const now = Date.now();
+  // SELF-HEAL after a manual DB reset (e.g. truncating rf_sessions to restart Session Data). Our in-memory
+  // _doneFinished cache otherwise marks a finished session "stored forever" and never re-writes it — so if
+  // the rows are wiped out-of-band, the data never comes back until the runner restarts. Every ~2 min,
+  // check which of TODAY's scheduled sessions we think are done actually still exist in the DB; for any
+  // that vanished, clear the caches so this cycle re-captures them.
+  if (!syncSessions._reconcileAt || (now - syncSessions._reconcileAt) > 120000){
+    syncSessions._reconcileAt = now;
+    try {
+      const todaysDone = list.map(s => s.uuid).filter(u => _doneFinished[u]);
+      if (todaysDone.length){
+        const { data: present } = await supa.from('rf_sessions').select('uuid').in('uuid', todaysDone);
+        const have = new Set((present || []).map(r => r.uuid));
+        let cleared = 0;
+        for (const u of todaysDone){ if (!have.has(u)){ delete _doneFinished[u]; delete _sessHash[u]; delete _seenOnce[u]; cleared++; } }
+        if (cleared) console.log(`[sessions] reconcile: ${cleared} finished session(s) missing from DB — re-capturing (likely a manual Session Data reset)`);
+      }
+    } catch (e) { /* reconcile is best-effort */ }
+  }
   // Which sessions to detail-fetch, in PRIORITY order so the fetch cap never starves live races:
   //   live      -> in-progress: roster/laps change every cycle.
   //   fresh     -> never seen: fetch once to store its label/time (upcoming slots have no karts yet).
@@ -282,7 +300,12 @@ async function syncSessions(rfJson){
     if (!_seenOnce[s.uuid]){ fresh.push(s); continue; }
     // upcoming & already stored -> nothing changes until its window opens
   }
-  const wanted = live.concat(fresh, backfill).slice(0, 25);
+  // PRIORITY: live races first (roster changing now), then BACKFILL (finished races we still need to
+  // capture — this is the actual Session Data payload), then fresh upcoming slots LAST. The old order put
+  // `fresh` (every not-yet-started slot for the rest of the day — often 25-30 of them) ahead of backfill,
+  // so with the fetch cap the finished races got sliced off and never captured ("no session data" even
+  // though the runner logged '25 written'). Upcoming empty slots have no karts yet — they can wait.
+  const wanted = live.concat(backfill, fresh).slice(0, 25);
   let wrote = 0, fetched = 0, healed = 0;
   for (const s of wanted){
     const schedStartMs = sydneyStrToMs(s.when);
