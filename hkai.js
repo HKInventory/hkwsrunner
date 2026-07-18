@@ -105,14 +105,17 @@ async function gatherContext(row){
   const recent = await q('rf_repairs', b => b.select('kart_name,kart_type,date_discovered,date_repaired,mechanic,description').or(`date_repaired.gte.${since14},date_discovered.gte.${since14}`).order('id', { ascending: false }).limit(150));
   if (recent.length){
     S.push('REPAIRS — LAST 14 DAYS (kart / date / mechanic / what):');
-    S.push(recent.map(r => `Kart ${r.kart_name} ${r.date_repaired || r.date_discovered || ''} ${r.mechanic || '?'}: ${String(r.description || '').slice(0, 110)}`).join('\n'));
+    S.push(recent.map(r => `Kart ${r.kart_name}${r.kart_type ? ' [' + r.kart_type + ']' : ''} ${r.date_repaired || r.date_discovered || ''} ${r.mechanic || '?'}: ${String(r.description || '').slice(0, 110)}`).join('\n'));
   }
   const asked = kartNumsIn(question);
   for (const num of asked.slice(0, 3)){
-    const hist = await q('rf_repairs', b => b.select('date_discovered,date_repaired,mechanic,description').eq('kart_name', String(num)).order('id', { ascending: false }).limit(80));
+    const hist = await q('rf_repairs', b => b.select('kart_type,date_discovered,date_repaired,mechanic,description').eq('kart_name', String(num)).order('id', { ascending: false }).limit(80));
     if (hist.length){
-      S.push(`FULL REPAIR HISTORY — KART ${num} (newest first):`);
-      S.push(hist.map(r => `${r.date_repaired || r.date_discovered || '?'} ${r.mechanic || '?'}: ${String(r.description || '').slice(0, 130)}`).join('\n'));
+      const types = [...new Set(hist.map(r => r.kart_type).filter(Boolean))];
+      // A number is shared across tracks — label each line with its track and warn if more than one track
+      // is present, so the model isolates the right kart instead of merging Junior/Adult/etc.
+      S.push(`REPAIR HISTORY — KART ${num}${types.length > 1 ? ` (⚠ shared across ${types.length} tracks: ${types.join(', ')} — these are DIFFERENT karts; filter by the track the user asked about)` : (types[0] ? ` [${types[0]}]` : '')} (newest first):`);
+      S.push(hist.map(r => `${r.kart_type ? r.kart_type + ' · ' : ''}${r.date_repaired || r.date_discovered || '?'} ${r.mechanic || '?'}: ${String(r.description || '').slice(0, 130)}`).join('\n'));
     }
   }
 
@@ -263,6 +266,7 @@ const TOOLS = [
   { name: 'repair_parts', description: 'List the parts used in repairs for a given kart (and/or keyword). Returns each part name, quantity and price against its repair. Use for "what parts went into kart N\'s repairs", "how many X have we fitted".',
     input_schema: { type: 'object', properties: {
       kart_no: { type: 'string', description: 'Kart number' },
+      track_type: { type: 'string', description: 'Track/kart type to disambiguate a number shared across tracks — e.g. "Junior", "Adult", "Mini", "Intermediate", "BattleKart". Kart numbers repeat across tracks; pass this whenever the user names a track.' },
       keyword: { type: 'string', description: 'Word in the part name' },
     } } },
   { name: 'staff_roster', description: 'The staff roster: names and roles. Use to answer "who works here", "who are the mechanics", or to resolve a first name to a full name.',
@@ -272,11 +276,13 @@ const TOOLS = [
   { name: 'kart_status', description: 'Get the COMPLETE current picture for ONE kart: its status (OK/For-Maintenance/Damaged/Long-Term), ALL its notes newest-first (open and resolved), and its recent repairs. ALWAYS call this when the user asks about a specific kart\'s condition/state/issue — it is the authoritative source for "what\'s wrong with kart N" and "is kart N ok". The newest note is the current word on the kart.',
     input_schema: { type: 'object', properties: {
       kart_no: { type: 'string', description: 'Kart number, required' },
+      track_type: { type: 'string', description: 'Track/kart type to disambiguate a number shared across tracks — e.g. "Junior", "Adult", "Mini", "Intermediate", "BattleKart". Kart numbers repeat across tracks; pass this whenever the user names a track.' },
     }, required: ['kart_no'] } },
   { name: 'query_repairs', description: 'Search repair records across ALL history. Filter by mechanic name, kart number, date range, and/or a keyword in the description. Returns the EXACT total match count (complete across all history) plus up to 300 example rows (newest first) with date, kart, mechanic and description — the count is exact even though only 300 lines are listed. Use for "how many repairs did X do", "repairs in <month>", cross-kart searches. For "most in a single day/week/month/year" or per-mechanic breakdowns use repair_stats. For one kart\'s full condition use kart_status instead.',
     input_schema: { type: 'object', properties: {
       mechanic: { type: 'string', description: 'Mechanic name or part of it (case-insensitive), e.g. "Jayden"' },
       kart_no: { type: 'string', description: 'Kart number, e.g. "43"' },
+      track_type: { type: 'string', description: 'Track/kart type to disambiguate a number shared across tracks — e.g. "Junior", "Adult", "Mini", "Intermediate", "BattleKart". A kart NUMBER repeats across tracks (Junior 16, Adult 16, …), each a different physical kart; pass this whenever the user names a track so different karts are not merged.' },
       from: { type: 'string', description: 'Start date inclusive, YYYY-MM-DD' },
       to: { type: 'string', description: 'End date inclusive, YYYY-MM-DD' },
       keyword: { type: 'string', description: 'Word to find in the repair description, e.g. "tyre", "wifi", "brake"' },
@@ -348,9 +354,13 @@ async function runTool(name, args, site){
     // repairs (filtered by kart) -> their parts
     let repIds = null;
     if (args.kart_no){
-      const reps = await q('rf_repairs', b => b.select('id').eq('kart_name', String(args.kart_no)).limit(400));
+      const reps = await q('rf_repairs', b => {
+        let bb = b.select('id').eq('kart_name', String(args.kart_no));
+        if (args.track_type) bb = bb.ilike('kart_type', `%${String(args.track_type).trim()}%`);   // disambiguate a number shared across tracks
+        return bb.limit(400);
+      });
       repIds = reps.map(r => r.id);
-      if (!repIds.length) return `No repairs found for kart ${args.kart_no}.`;
+      if (!repIds.length) return `No repairs found for kart ${args.kart_no}${args.track_type ? ' (' + args.track_type + ')' : ''}.`;
     }
     const parts = await pageAll('rf_repair_parts', b => {
       let bb = b.select('repair_id,part_name,qty,price');
@@ -378,14 +388,18 @@ async function runTool(name, args, site){
   if (name === 'kart_status'){
     if (!args.kart_no) return 'kart_no is required.';
     const kn = String(args.kart_no);
-    const karts = await q('rf_karts', b => b.select('rf_id,name,type,status,long_term').eq('site', site).eq('name', kn).limit(3));
+    let karts = await q('rf_karts', b => b.select('rf_id,name,type,status,long_term').eq('site', site).eq('name', kn).limit(8));
     if (!karts.length) return `No kart numbered ${kn} found for this site.`;
+    // A number repeats across tracks (Junior 16, Adult 16, …), each a DIFFERENT physical kart. Narrow by
+    // the requested track; if still ambiguous, ask which track rather than silently picking one.
+    if (args.track_type){ const t = String(args.track_type).toLowerCase().trim(); const m = karts.filter(x => String(x.type || '').toLowerCase().includes(t)); if (m.length) karts = m; }
+    if (karts.length > 1) return `Kart ${kn} exists on ${karts.length} tracks — ${karts.map(x => x.type || '?').join(', ')} — each a different physical kart with its own history. Which track do you mean? (pass track_type)`;
     const k = karts[0];
     const statusTxt = k.long_term ? 'LONG-TERM (out of active fleet)' : (k.status === 'damaged' ? 'DAMAGED' : (k.status === 'maint' || k.status === 'for_maintenance' ? 'FOR-MAINTENANCE' : 'OK'));
     // ALL notes for this kart, newest first (open + resolved), across all history
     const notes = await pageAll('rf_kart_notes', b => b.select('note,created_by,created_at,active').eq('rf_kart_id', k.rf_id).order('created_at', { ascending: false }), 2000);
-    // recent repairs for this kart
-    const reps = await q('rf_repairs', b => b.select('date_discovered,date_repaired,mechanic,description').eq('kart_name', kn).order('id', { ascending: false }).limit(40));
+    // recent repairs for THIS physical kart — keyed on rf_kart_id (exact), not the shared number
+    const reps = await q('rf_repairs', b => b.select('date_discovered,date_repaired,mechanic,description').eq('rf_kart_id', k.rf_id).order('id', { ascending: false }).limit(40));
     let out = `KART ${kn} [${k.type || ''}] — STATUS: ${statusTxt}.\n`;
     if (notes.length){
       const open = notes.filter(n => n.active), closed = notes.filter(n => !n.active);
@@ -400,9 +414,10 @@ async function runTool(name, args, site){
   }
   if (name === 'query_repairs'){
     const rows = await pageAll('rf_repairs', b => {
-      let bb = b.select('kart_name,date_discovered,date_repaired,mechanic,description');
+      let bb = b.select('kart_name,kart_type,date_discovered,date_repaired,mechanic,description');
       if (args.mechanic) bb = bb.ilike('mechanic', `%${args.mechanic}%`);
       if (args.kart_no) bb = bb.eq('kart_name', String(args.kart_no));
+      if (args.track_type) bb = bb.ilike('kart_type', `%${String(args.track_type).trim()}%`);   // disambiguate a number shared across tracks
       if (args.from) bb = bb.or(`date_repaired.gte.${args.from},date_discovered.gte.${args.from}`);
       if (args.to) bb = bb.or(`date_repaired.lte.${args.to},date_discovered.lte.${args.to}`);
       return bb.order('id', { ascending: false });
@@ -411,9 +426,12 @@ async function runTool(name, args, site){
     if (args.keyword){ const k = args.keyword.toLowerCase(); filtered = rows.filter(r => String(r.description || '').toLowerCase().includes(k)); }
     if (args.from){ filtered = filtered.filter(r => (r.date_repaired || r.date_discovered || '') >= args.from); }
     if (args.to){ filtered = filtered.filter(r => (r.date_repaired || r.date_discovered || '9999') <= args.to); }
-    if (args.count_only) return `COUNT: ${filtered.length} repair(s) match.`;
-    const list = filtered.slice(0, 300).map(r => `${r.date_repaired || r.date_discovered || '?'} · Kart ${r.kart_name} · ${r.mechanic || '?'}: ${String(r.description || '').slice(0, 140)}`);
-    return `${filtered.length} repair(s) match${filtered.length > 300 ? ' (showing first 300)' : ''}:\n` + list.join('\n');
+    if (args.count_only) return `COUNT: ${filtered.length} repair(s) match${args.kart_no && !args.track_type ? ` (kart ${args.kart_no} ACROSS ALL TRACKS — Junior/Adult/Mini/etc. combined; pass track_type to isolate one)` : ''}.`;
+    // Show kart_type on every line so a number shared across tracks is never silently merged.
+    const list = filtered.slice(0, 300).map(r => `${r.date_repaired || r.date_discovered || '?'} · Kart ${r.kart_name}${r.kart_type ? ' [' + r.kart_type + ']' : ''} · ${r.mechanic || '?'}: ${String(r.description || '').slice(0, 140)}`);
+    const ambig = args.kart_no && !args.track_type ? [...new Set(filtered.map(r => r.kart_type).filter(Boolean))] : [];
+    const note = ambig.length > 1 ? `\nNOTE: kart ${args.kart_no} exists on ${ambig.length} tracks (${ambig.join(', ')}) — these are DIFFERENT physical karts. Re-call with track_type to isolate one, or break the answer down by track.` : '';
+    return `${filtered.length} repair(s) match${filtered.length > 300 ? ' (showing first 300)' : ''}:\n` + list.join('\n') + note;
   }
   if (name === 'repair_stats'){
     // Aggregate the WHOLE repair history server-side so the model can answer "most repairs in a
@@ -570,6 +588,7 @@ Never answer "I don't have that data" without first trying the relevant tool. Th
 RULES:
 - Never invent karts, repairs, people, sessions or readings. If a tool returns nothing, say so plainly.
 - When the question is about ONE specific kart's condition/state/issue/status ("what's wrong with kart N", "is kart N ok", "does kart N have a X problem"), you MUST call kart_status for that kart. Do not answer a single-kart condition question from the snapshot or from repairs alone.
+- Kart NUMBERS repeat across track types: there is a Junior 16, an Adult 16, a Mini 16, etc. — each a DIFFERENT physical kart with its own repairs and notes. When the user names a track (Junior/Adult/Mini/Intermediate/BattleKart/Twin), ALWAYS pass track_type to kart_status / query_repairs / repair_parts so you isolate that one kart and never merge different karts' histories. If the user gives a number with NO track and the number exists on more than one track, do NOT combine them — say which tracks have that number and ask which one they mean (or break the answer down per track). kart_type is shown on repair lines and in the snapshot; use it.
 - The NEWEST note is the current word on a kart. Lead with it. If the newest note says the kart was taken out of rotation / still faulty / not fixed, say that is the current status — even if an earlier repair said "tested fine". A later note about the same fault OVERRIDES an earlier "fixed" repair. Never conclude a kart is "running okay" if a more recent note contradicts it.
 - For "how many" questions, use the tool (query_repairs with count_only, or search_notes) rather than eyeballing — then state the number, then list. query_repairs returns the EXACT total across all history (the count is complete even though only 300 example lines are shown), so never say a count is approximate or "capped" — the number is exact.
 - For "who did the MOST in a single day / week / month / year", "busiest day", "record holder", or any per-mechanic time breakdown, call repair_stats (ONE call answers it precisely over the whole history). Do NOT try to reconstruct this by paging query_repairs date-by-date, and never give a "~approx" answer or an "I can't without iterating" caveat — repair_stats gives the exact figures.
