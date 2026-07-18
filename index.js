@@ -68,7 +68,7 @@ const NOTES_CONC  = Math.max(2, Math.min(12, parseInt(process.env.NOTES_CONCURRE
 //   • rotating      -> NO signal, so every cycle blind-fetches a batch; keep this gentler to respect the ~105GB/mo
 //                      outbound cap (fast blind rotation across ~190 karts would blow it). This path is the reason
 //                      note-adds are slow; the real fix is a working signal (see notesFromNotifications).
-const NOTES_POLL        = Math.max(2, parseInt(process.env.NOTES_POLL_SEC        || '8',  10)) * 1000;
+const NOTES_POLL        = Math.max(2, parseInt(process.env.NOTES_POLL_SEC        || '20', 10)) * 1000;
 const NOTES_POLL_ROTATE = Math.max(5, parseInt(process.env.NOTES_POLL_ROTATE_SEC || '20', 10)) * 1000;
 // Safety-net FULL sweep on a wall-clock timer (catches the rare change no targeted pass can see, e.g. a note
 // edited in place whose list-flag never changes).
@@ -228,7 +228,7 @@ function loop(tag, gapMs, extraEnv){
   return { start(delay){ timer = setTimeout(run, delay || 0); }, stop(){ clearTimeout(timer); } };
 }
 
-log(`combined worker up · site=${SITE} · pusher live · status ~${STATUS_POLL / 1000}s · notes ~${NOTES_POLL / 1000}s (flagged) / ~${NOTES_POLL_ROTATE / 1000}s (rotating) · full-sync ~${HEAVY_GAP / 1000}s · build=kni-fix-2026-07-18g`);
+log(`combined worker up · site=${SITE} · pusher live · status ~${STATUS_POLL / 1000}s · notes ~${NOTES_POLL / 1000}s (flagged) / ~${NOTES_POLL_ROTATE / 1000}s (rotating) · full-sync ~${HEAVY_GAP / 1000}s · build=kni-fix-2026-07-18h`);
 
 // SESSIONS: poll RaceFacer session-management on the SAME shared login, so the app + HK AI
 // know which karts are in which session (and their time windows). Write-on-change; prunes to 7 days.
