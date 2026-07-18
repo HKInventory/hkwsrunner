@@ -30,19 +30,29 @@ const KART_DETAILS_INTERVAL_MS = Math.max(300000, (parseInt(process.env.KART_DET
 
 const insecure = new Agent({ connect: { rejectUnauthorized: false } }); // accept the self-signed cert
 
-// ---- tiny cookie jar ----
+// ---- tiny cookie jars ----
+// Two independent RaceFacer sessions. RaceFacer is PHP/Laravel, which LOCKS a session for the duration of
+// each request — so requests sharing one session cookie SERIALIZE server-side. A slow ~20s notes-page
+// fetch on the shared session would hold that lock and stall every status poll behind it (the observed
+// 5-13s status cycles). `jarStatus` gives the fast status loop its OWN session so it never waits on the
+// shared one; everything else (notes, sessions, heavy read-backs) keeps `jar`.
 const jar = {};
+const jarStatus = {};
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-function storeCookies(res) {
+function storeCookies(res, j) {
+  j = j || jar;
   for (const c of res.headers.getSetCookie?.() || []) {
     const [pair] = c.split(';'); const i = pair.indexOf('=');
     if (i > 0) {
       const k = pair.slice(0, i).trim(), v = pair.slice(i + 1).trim();
-      if (v && v.toLowerCase() !== 'deleted') jar[k] = v; // don't let a stray response clear our session
+      if (v && v.toLowerCase() !== 'deleted') j[k] = v; // don't let a stray response clear our session
     }
   }
 }
-const cookieHeader = () => Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ');
+const cookieHeader = (j) => Object.entries(j || jar).map(([k, v]) => `${k}=${v}`).join('; ');
+// Use the dedicated status session when it's actually logged in (the main worker process), otherwise fall
+// back to the shared session (e.g. inside the spawned heavy child, which never establishes jarStatus).
+const statusJar = () => (jarStatus['laravel_session'] ? jarStatus : jar);
 
 // Turn RaceFacer type + number into the team's label, e.g. "Adult Track" + "19" -> "Adult 19".
 function kartLabel(type, name) {
@@ -52,22 +62,23 @@ function kartLabel(type, name) {
   return t ? `${t} ${n}`.trim() : (n || null);
 }
 
-async function rf(path, { method = 'GET', body, headers = {}, ajax = false } = {}) {
+async function rf(path, { method = 'GET', body, headers = {}, ajax = false, jar: j } = {}) {
+  j = j || jar;
   // RaceFacer's ajax/* endpoints only return JSON when the request looks like an XHR (what jQuery sends).
   const ajaxHeaders = ajax ? { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json, text/javascript, */*; q=0.01' } : {};
   const res = await fetch(path.startsWith('http') ? path : RF_BASE + path, {
     method, body, redirect: 'manual', dispatcher: insecure,
-    headers: { 'Cookie': cookieHeader(), 'User-Agent': 'Mozilla/5.0 HKWorkshopSync/1.0', ...ajaxHeaders, ...headers },
+    headers: { 'Cookie': cookieHeader(j), 'User-Agent': 'Mozilla/5.0 HKWorkshopSync/1.0', ...ajaxHeaders, ...headers },
   });
-  storeCookies(res);
+  storeCookies(res, j);
   return res;
 }
 
 // fetch an ajax endpoint and parse JSON; clear error (with HTTP status) if it isn't JSON
-async function rfJson(path, tries = 3) {
+async function rfJson(path, tries = 3, j) {
   let res, text;
   for (let i = 0; i < tries; i++) {
-    res = await rf(path, { ajax: true });
+    res = await rf(path, { ajax: true, jar: j });
     text = await res.text();
     if (text) { try { return JSON.parse(text); } catch { /* empty/garbled -> retry */ } }
     if (i < tries - 1) await sleep(400 * (i + 1)); // brief back-off, then try again
@@ -76,8 +87,11 @@ async function rfJson(path, tries = 3) {
 }
 
 // ---- login ----
-async function login() {
-  const page = await (await rf('/en/auth/login')).text();
+// Logs into RaceFacer, storing cookies in jar `j` (defaults to the shared jar). Pass jarStatus to
+// establish the status loop's dedicated session.
+async function login(j) {
+  j = j || jar;
+  const page = await (await rf('/en/auth/login', { jar: j })).text();
   const formMatch = page.match(/<form[^>]*action="([^"]*login[^"]*)"[^>]*>([\s\S]*?)<\/form>/i);
   const action = formMatch ? formMatch[1] : '/en/auth/login';
   const formHtml = formMatch ? formMatch[2] : page;
@@ -95,11 +109,13 @@ async function login() {
   body.set('password', RF_PASS);
   console.log('[login] action=%s fields=%s', action, [...body.keys()].join(','));
 
-  const res = await rf(action, { method: 'POST', body: body.toString(), headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
-  console.log('[login] POST status=%s location=%s', res.status, res.headers.get('location') || '(none)');
-  if (!jar['laravel_session']) throw new Error(`login failed (status ${res.status}); no session cookie`);
+  const res = await rf(action, { method: 'POST', body: body.toString(), headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, jar: j });
+  console.log('[login] POST status=%s location=%s%s', res.status, res.headers.get('location') || '(none)', j === jarStatus ? ' (status session)' : '');
+  if (!j['laravel_session']) throw new Error(`login failed (status ${res.status}); no session cookie`);
   return true;
 }
+// Establish/refresh the status loop's DEDICATED session (see the jarStatus note above).
+function loginStatus(){ return login(jarStatus); }
 
 // ---- current track layout: pull RaceFacer's "track configurations", flag the live one ----
 // /settings -> track_configurations (id = the layout's identity, sub_track_id = physical track, name).
@@ -227,7 +243,7 @@ async function refreshLiveTracks() {
     const cfgOf = (s) => byName.get(String(s.configuration).trim().toLowerCase());
     const byTimeDesc = (a, b) => String(b.start_time_key || '').localeCompare(String(a.start_time_key || ''));
 
-    const sch = await rfJson(`/ajax/session-management/sessions-schedule?date=${dayOf(new Date())}`);
+    const sch = await rfJson(`/ajax/session-management/sessions-schedule?date=${dayOf(new Date())}`, 3, statusJar());   // status-loop call -> status session
     const today = ((sch && sch.schedule && sch.schedule.data) || []).filter((x) => x && x.type === 'session' && x.configuration);
     const mains = today.filter((s) => { const c = cfgOf(s); return c && !isSet(c); });
     if (!mains.length) { await closeStaleOpenSegments(SITE, TZ); return; }   // venue closed / pre-open — flush yesterday's open span, leave today's flags as the heavy pass left them
@@ -1145,10 +1161,12 @@ async function notesFast(garageFlags, opts) {
   // kart, an in-place resolve, or anything the flags can't see is caught by the periodic global
   // Kart Notes page sweep instead. With no list-flags this cycle there's no cheap signal, so do nothing.
   if (flagsOnly) {
-    if (sawFlags) {
-      if (garageFlags) for (const id of garageFlags) if (!dbFlag.has(id)) toCheck.add(id);   // new note on a clean kart
-      for (const id of dbFlag) if (!(garageFlags && garageFlags.has(id))) toCheck.add(id);    // last note cleared
-    }
+    // ADDS ONLY: a kart the garage list flags as having a note that the DB doesn't know yet -> likely a
+    // NEW note. We deliberately do NOT do the inverse ("DB-open but not flagged -> cleared"): this venue's
+    // list note-flags are INCOMPLETE (they mark only a fraction of note-bearing karts), so treating every
+    // unflagged open-note kart as cleared re-fetched ~98 karts EVERY cycle and starved status. Deletes /
+    // resolves, and any add the incomplete flags miss, are handled by the periodic global-page sweep.
+    if (sawFlags && garageFlags) for (const id of garageFlags) if (!dbFlag.has(id)) toCheck.add(id);
   } else if (sawFlags) {
     // Authoritative list-flags => fetch ONLY karts whose note state CHANGED since the DB was written:
     //   • flagged on the list but NOT in the DB  -> a NEW note appeared -> fetch + write it.
@@ -1177,7 +1195,10 @@ async function notesFast(garageFlags, opts) {
     }
   }
 
-  const ids = [...toCheck];
+  let ids = [...toCheck];
+  // Hard safety cap on the fast (flags-only) path so a noisy/incomplete flag signal can NEVER turn into a
+  // fetch storm that starves status — the authoritative global-page sweep is the real reconciler anyway.
+  if (flagsOnly && ids.length > 12) { ids = ids.slice(0, 12); }
   if (!ids.length) return 0;
   // Fetch concurrently (bounded) rather than one-at-a-time with sleeps — a delete/resolve should clear in
   // ~one poll, not drip out over several seconds. readKartNotes never throws.
@@ -1229,9 +1250,13 @@ async function statusFast() {
   catch (e) { console.error(`[fast] couldn't read fleet: ${e.message}`); return 0; }
   if (!cur.size) return 0;                             // nothing known yet — the full sync will populate it
 
-  const uuids = Object.keys(KART_TYPES);
+  // Only the garage pages for THIS site — no point fetching Melbourne's page on a Sydney worker every
+  // ~2s. And route them through the dedicated status session so a slow shared-session request can't lock
+  // status out server-side (see the jarStatus note at the top).
+  const uuids = Object.keys(KART_TYPES).filter((u) => (KART_TYPES[u].site || 'sydney') === SITE);
+  const sj = statusJar();
   const lists = await Promise.all(uuids.map(async (uuid) => {
-    try { const html = await (await rf(`/en/administration/garage/garage?kart_type_uuid=${uuid}`)).text(); return parseGarageStatuses(html); }
+    try { const html = await (await rf(`/en/administration/garage/garage?kart_type_uuid=${uuid}`, { jar: sj })).text(); return parseGarageStatuses(html); }
     catch (e) { return []; }                          // a page that fails this cycle just gets skipped; the next cycle/heavy covers it
   }));
 
@@ -1369,4 +1394,4 @@ async function main() {
 }
 
 if (require.main === module) main().catch((e) => { console.error(e); process.exit(1); });
-module.exports = { login, rfJson, enumerateKarts, syncKart, statusFast, reconcileToday, logTrackSegments, refreshLiveTracks, sweepNotesAll, notesFast, notesFromNotifications, notesFromKartNotesPage, getKartNoteIndex, readKartNotes, _kniExtractRaw };
+module.exports = { login, loginStatus, rfJson, enumerateKarts, syncKart, statusFast, reconcileToday, logTrackSegments, refreshLiveTracks, sweepNotesAll, notesFast, notesFromNotifications, notesFromKartNotesPage, getKartNoteIndex, readKartNotes, _kniExtractRaw };

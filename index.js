@@ -80,6 +80,12 @@ const NOTES_FULL_SWEEP_MS = Math.max(60, parseInt(process.env.NOTES_FULL_SWEEP_S
 let _loginP = null;
 function ensureLogin(){ if (!_loginP) _loginP = sync.login().then(() => { log('RaceFacer session up'); }); return _loginP.catch((e) => { _loginP = null; throw e; }); }
 function dropLogin(){ _loginP = null; }
+// The STATUS loop gets its OWN RaceFacer session (see the jarStatus note in racefacer-sync.js): RaceFacer
+// locks a session per in-flight request, so sharing one session made status queue behind the slow
+// notes-page fetch. A separate session frees the fast status poll from that server-side lock entirely.
+let _loginSP = null;
+function ensureLoginStatus(){ if (!_loginSP) _loginSP = sync.loginStatus().then(() => { log('RaceFacer STATUS session up'); }); return _loginSP.catch((e) => { _loginSP = null; throw e; }); }
+function dropLoginStatus(){ _loginSP = null; }
 function sleep(ms){ return new Promise((r) => setTimeout(r, ms)); }
 
 // STATUS loop — tight and independent. Just the ~5 garage list pages + write-changed status. This no
@@ -95,7 +101,7 @@ async function statusLoop(){
   while (!stopping){
     const t0 = Date.now();
     try {
-      await ensureLogin();
+      await ensureLoginStatus();                 // dedicated status session — not the shared, lock-contended one
       const changed = await sync.statusFast();
       if (changed) log(`status: ${changed} kart(s) changed`);
       if (typeof sync.refreshLiveTracks === 'function' && Date.now() - _lastLiveTracks >= LIVE_TRACKS_MS) {
@@ -105,7 +111,7 @@ async function statusLoop(){
       fails = 0;
     } catch (e){
       fails++;
-      if (/login|session|401|403/i.test(e.message || '')) dropLogin();
+      if (/login|session|401|403/i.test(e.message || '')) dropLoginStatus();
       if (fails <= 3 || fails % 10 === 0) log(`status poll error (${fails}): ${e.message}`);
       if (fails > 3) await sleep(Math.min(30000, fails * 1000));   // back off if RaceFacer is unhappy
     }
@@ -227,7 +233,7 @@ function loop(tag, gapMs, extraEnv){
   return { start(delay){ timer = setTimeout(run, delay || 0); }, stop(){ clearTimeout(timer); } };
 }
 
-log(`combined worker up · site=${SITE} · pusher live · status ~${STATUS_POLL / 1000}s · notes ~${NOTES_POLL / 1000}s (flagged) / ~${NOTES_POLL_ROTATE / 1000}s (rotating) · full-sync ~${HEAVY_GAP / 1000}s · build=kni-fix-2026-07-18k`);
+log(`combined worker up · site=${SITE} · pusher live · status ~${STATUS_POLL / 1000}s · notes ~${NOTES_POLL / 1000}s (flagged) / ~${NOTES_POLL_ROTATE / 1000}s (rotating) · full-sync ~${HEAVY_GAP / 1000}s · build=kni-fix-2026-07-18l`);
 
 // SESSIONS: poll RaceFacer session-management on the SAME shared login, so the app + HK AI
 // know which karts are in which session (and their time windows). Write-on-change; prunes to 7 days.
