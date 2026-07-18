@@ -564,10 +564,17 @@ async function syncKart(id, meta, repairsByKart) {
   if (phRows.length) await sb('rf_parts_history', { method: 'POST', body: phRows });
 
   let notesWritten = 0;
-  // Which notes is RaceFacer currently showing in its top "active" list (starred, not X'd)?
-  // Their fingerprints match the same notes in the Kart Notes table, so we can flag them.
-  const activeFps = activeNoteMap(id, dj.html);   // Map(fp -> notifId): flags active notes AND captures the id a repair needs to clear them
-  try { notesWritten = await syncKartNotes(id, site, activeFps); } catch (e) { console.error(`[notes] kart ${id} failed: ${e.message}`); }
+  // Notes are owned by the worker's in-process notesLoop (+ its periodic full sweep). The heavy child
+  // sets HEAVY_SKIP_KART_NOTES=1 so it does NOT re-fetch/re-sync every kart's notes here — that was a
+  // third RaceFacer fetch per kart (~230/run) duplicating work notesLoop already does, needlessly
+  // pinning the shared box and starving status. When the flag isn't set (e.g. a manual/one-off run of
+  // this script), notes still sync as before.
+  if (process.env.HEAVY_SKIP_KART_NOTES !== '1') {
+    // Which notes is RaceFacer currently showing in its top "active" list (starred, not X'd)?
+    // Their fingerprints match the same notes in the Kart Notes table, so we can flag them.
+    const activeFps = activeNoteMap(id, dj.html);   // Map(fp -> notifId): flags active notes AND captures the id a repair needs to clear them
+    try { notesWritten = await syncKartNotes(id, site, activeFps); } catch (e) { console.error(`[notes] kart ${id} failed: ${e.message}`); }
+  }
 
   return { id, name: details.name, type: type, site: site, label: kartLabel(type, details.name), repairs, notesWritten };
 }

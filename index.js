@@ -68,11 +68,11 @@ const NOTES_CONC  = Math.max(2, Math.min(12, parseInt(process.env.NOTES_CONCURRE
 //   • rotating      -> NO signal, so every cycle blind-fetches a batch; keep this gentler to respect the ~105GB/mo
 //                      outbound cap (fast blind rotation across ~190 karts would blow it). This path is the reason
 //                      note-adds are slow; the real fix is a working signal (see notesFromNotifications).
-const NOTES_POLL        = Math.max(2, parseInt(process.env.NOTES_POLL_SEC        || '4',  10)) * 1000;
+const NOTES_POLL        = Math.max(2, parseInt(process.env.NOTES_POLL_SEC        || '8',  10)) * 1000;
 const NOTES_POLL_ROTATE = Math.max(5, parseInt(process.env.NOTES_POLL_ROTATE_SEC || '20', 10)) * 1000;
 // Safety-net FULL sweep on a wall-clock timer (catches the rare change no targeted pass can see, e.g. a note
 // edited in place whose list-flag never changes).
-const NOTES_FULL_SWEEP_MS = Math.max(60, parseInt(process.env.NOTES_FULL_SWEEP_SEC || '900', 10)) * 1000;
+const NOTES_FULL_SWEEP_MS = Math.max(60, parseInt(process.env.NOTES_FULL_SWEEP_SEC || '1800', 10)) * 1000;
 
 // ONE login shared by the status poller and the notes sweeper (same module = same cookie jar).
 // The promise-guard stops both loops logging in at the same moment; an auth error resets it so
@@ -197,7 +197,7 @@ const SCRIPT     = path.join(__dirname, 'racefacer-sync.js');
 // Repairs/parts/prune/reconcile (all the heavy child does that the fast loops don't) are NOT
 // latency-sensitive, so running them every ~5min instead of ~2min barely affects freshness while roughly
 // halving the window in which status/notes are contended. Override with HEAVY_GAP_SEC if needed.
-const HEAVY_GAP  = Math.max(60,  parseInt(process.env.HEAVY_GAP_SEC     || '300', 10)) * 1000;
+const HEAVY_GAP  = Math.max(60,  parseInt(process.env.HEAVY_GAP_SEC     || '600', 10)) * 1000;
 const TIMEOUT_MS = Math.max(120, parseInt(process.env.CYCLE_TIMEOUT_SEC || '600', 10)) * 1000;
 const SITE       = (process.env.SITE || 'sydney').trim().toLowerCase();
 
@@ -228,7 +228,7 @@ function loop(tag, gapMs, extraEnv){
   return { start(delay){ timer = setTimeout(run, delay || 0); }, stop(){ clearTimeout(timer); } };
 }
 
-log(`combined worker up · site=${SITE} · pusher live · status ~${STATUS_POLL / 1000}s · notes ~${NOTES_POLL / 1000}s (flagged) / ~${NOTES_POLL_ROTATE / 1000}s (rotating) · full-sync ~${HEAVY_GAP / 1000}s · build=kni-fix-2026-07-18e`);
+log(`combined worker up · site=${SITE} · pusher live · status ~${STATUS_POLL / 1000}s · notes ~${NOTES_POLL / 1000}s (flagged) / ~${NOTES_POLL_ROTATE / 1000}s (rotating) · full-sync ~${HEAVY_GAP / 1000}s · build=kni-fix-2026-07-18f`);
 
 // SESSIONS: poll RaceFacer session-management on the SAME shared login, so the app + HK AI
 // know which karts are in which session (and their time windows). Write-on-change; prunes to 7 days.
@@ -260,7 +260,12 @@ notesLoop().catch((e) => log(`notes poller crashed: ${e.message}`));
 sessionsPoller().catch((e) => log(`sessions poller crashed: ${e.message}`));
 
 // Heavy: full reconcile (repairs, parts, prune, reconcile) in its own spawned process.
-const heavyLoop = loop('heavy', HEAVY_GAP, { STATUS_ONLY: '', NOTES_ONLY: '', HEAVY_INTERVAL_SEC: '60' });
+// HEAVY_SKIP_KART_NOTES: the heavy child's per-kart loop used to fetch kart-notes for all ~230 karts
+// every run (a third fetch per kart, on top of details + parts) — but the in-process notesLoop and its
+// full sweep already own notes, so that was ~230 redundant RaceFacer requests per heavy run, needlessly
+// lengthening the window in which the shared box is pinned and status is starved. Skip it in the heavy
+// child; notes stay owned by notesLoop (+ its periodic sweepNotesAll backstop).
+const heavyLoop = loop('heavy', HEAVY_GAP, { STATUS_ONLY: '', NOTES_ONLY: '', HEAVY_INTERVAL_SEC: '60', HEAVY_SKIP_KART_NOTES: '1' });
 heavyLoop.start(9000);   // stagger so the first RaceFacer logins don't collide
 
 function shutdown(sig){
