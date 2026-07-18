@@ -813,6 +813,13 @@ function _kniExtractRaw(text, add){
   if (!any) grab(/data-id="(\d+)"[^>]{0,120}?data-kart-id="(\d+)"()/g);
   return any;
 }
+async function _kniFetch(url){
+  const out = [], seen = new Set();
+  const add = (id, kart, note, archived) => { const n = Number(id); if (!n || seen.has(n)) return false; seen.add(n); out.push({ kartNoteId: n, rfKartId: (kart != null && /^\d+$/.test(String(kart))) ? Number(kart) : null, note: note != null ? String(note).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() : null, archived: archived === true ? true : (archived === false ? false : null) }); return true; };
+  let text = ''; try { text = await (await rf(url, { ajax: true })).text(); } catch (e) { return { data: [], sample: '' }; }
+  _kniExtractRaw(text, add);
+  return { data: out, sample: text.slice(0, 600) };
+}
 // Fetch the note index from the global Kart Notes PAGE (rows are server-rendered there, unlike the
 // kart-notes-table ajax which returns an empty shell without params). Returns [] on miss.
 async function _fetchNotesViaPage(){
