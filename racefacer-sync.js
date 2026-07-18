@@ -1297,18 +1297,31 @@ async function statusFast() {
   const noteFlags = new Set();   // karts the garage list shows as having an open note (garage-page path only)
   let scanned = 0, viaKI = false;
 
-  // ---- primary: ONE karts-info JSON request ------------------------------------------------------
-  // karts-info returned 0 records unscoped on this box (it's kart_id-scoped), so it's OPT-IN now
-  // (STATUS_VIA_KARTS_INFO=1) rather than the default — no point probing a dead endpoint hourly.
-  const kiAllowed = process.env.STATUS_VIA_KARTS_INFO === '1'
+  // ---- primary: karts-info JSON, ONE scoped call per distinct track-type, across the session pool -----
+  // The box is slow PER REQUEST during races because it's rendering heavy garage admin HTML pages. The
+  // karts-info endpoint is a lightweight JSON API (what the pusher uses). Unscoped it returns 0, but
+  // ?kart_id=<X> returns X's whole type-group, so one scoped call per distinct type covers the fleet.
+  // Fetched in parallel across the pool + timed, so the log proves whether JSON beats the ~5s HTML floor.
+  const kiAllowed = process.env.STATUS_VIA_KARTS_INFO !== '0'
     && (_kiMode === 'karts-info' || _kiMode === null || Date.now() >= _kiRetryAt);
   if (kiAllowed) {
     try {
-      const j = await rfJson('/ajax/kart/karts-info', 2, statusJar());
-      const groups = (j && (j.kart_names || j.karts || j.karts_info)) || {};
-      const recs = [];
-      for (const g in groups){ const arr = groups[g]; if (Array.isArray(arr)) for (const x of arr){ if (x && x.id != null && x.kart_status_id != null) recs.push(x); } }
-      if (!recs.length && Array.isArray(j)) for (const x of j){ if (x && x.id != null && x.kart_status_id != null) recs.push(x); }
+      const repByType = new Map();
+      for (const [rfId, t] of curType) { if (t != null && !repByType.has(t)) repByType.set(t, rfId); }   // one kart id per type
+      const reps = [...repByType.values()];
+      const pool = statusPool();
+      const t0req = Date.now();
+      const responses = await Promise.all(reps.map(async (rep, i) => {
+        try { return await rfJson(`/ajax/kart/karts-info?kart_id=${rep}`, 2, pool[i % pool.length]); }
+        catch (e) { return null; }
+      }));
+      const kiMs = Date.now() - t0req;
+      const recs = [], seenRec = new Set();
+      const collect = (arr) => { for (const x of arr) if (x && x.id != null && x.kart_status_id != null && !seenRec.has(Number(x.id))) { seenRec.add(Number(x.id)); recs.push(x); } };
+      for (const j of responses) { if (!j) continue;
+        const groups = (j.kart_names || j.karts || j.karts_info); if (groups && typeof groups === 'object') for (const g in groups) if (Array.isArray(groups[g])) collect(groups[g]);
+        if (Array.isArray(j)) collect(j);
+      }
       if (recs.length >= cur.size * 0.6) {
         // one-time semantic validation: kart_status_id must broadly AGREE with the DB's current
         // status_codes (which the garage pages populated). Mass disagreement = wrong field meaning.
@@ -1321,8 +1334,8 @@ async function statusFast() {
           } else { _kiValidated = true; }
         }
         if (_kiValidated) {
-          if (_kiMode !== 'karts-info') { _kiMode = 'karts-info'; console.log(`[fast] status source: karts-info — ${recs.length} karts in ONE request (was ~6 garage pages/cycle)`); }
-          _kiFails = 0; viaKI = true;
+          if (_kiMode !== 'karts-info') { _kiMode = 'karts-info'; console.log(`[fast] status source: karts-info JSON — ${reps.length} type-call(s) across ${pool.length} session(s), ${recs.length} karts in ${kiMs}ms (garage pages were ~5s)`); }
+          _kiFails = 0; viaKI = true; statusFast._lastMs = kiMs;
           for (const x of recs) {
             const rfId = Number(x.id), sc = Number(x.kart_status_id);
             if (!Number.isFinite(rfId) || !cur.has(rfId) || seen.has(rfId)) continue;
@@ -1330,14 +1343,12 @@ async function statusFast() {
             if (sc !== 1 && sc !== 2 && sc !== 3) continue;      // unknown status id — skip, never guess
             if (cur.get(rfId) === sc) continue;                  // unchanged: no write, no broadcast
             rows.push({ rf_id: rfId, status: (sc === 2 ? 'DAMAGED' : sc === 3 ? 'FOR MAINTENANCE' : 'OK'), status_code: sc, fetched_at: now });
-            // NOTE: no `type` write on this path — karts-info's kart_type_id is numeric with no
-            // name/site map in this codebase; track-type moves are owned by the heavy sync's
-            // enumerate/syncKart pass (page-derived, authoritative).
           }
+          if (kiMs > 4000) console.log(`[fast] karts-info still ${kiMs}ms — the box is slow even for JSON during races; this is the per-request floor`);
         }
       } else {
         _kiMode = 'garage-pages'; _kiRetryAt = Date.now() + 3600000;   // scoped/partial — re-probe hourly
-        console.log(`[fast] karts-info returned ${recs.length} record(s) vs fleet ${cur.size} — scoped response; falling back to garage pages (re-probe in 1h)`);
+        console.log(`[fast] karts-info per-type returned ${recs.length} of fleet ${cur.size} in ${kiMs}ms — insufficient; falling back to garage pages (re-probe in 1h)`);
       }
     } catch (e) {
       if (++_kiFails >= 3) { _kiMode = 'garage-pages'; _kiRetryAt = Date.now() + 600000; _kiFails = 0;
@@ -1350,11 +1361,18 @@ async function statusFast() {
   if (!viaKI) {
     const uuids = Object.keys(KART_TYPES).filter((u) => (KART_TYPES[u].site || 'sydney') === SITE);
     const pool = statusPool();
+    const t0g = Date.now(); let slowest = 0;
     const lists = await Promise.all(uuids.map(async (uuid, i) => {
       const j = pool[i % pool.length];   // one distinct session per concurrent fetch (round-robin if fewer than pages)
-      try { const html = await (await rf(`/en/administration/garage/garage?kart_type_uuid=${uuid}`, { jar: j })).text(); return parseGarageStatuses(html); }
+      const t = Date.now();
+      try { const html = await (await rf(`/en/administration/garage/garage?kart_type_uuid=${uuid}`, { jar: j })).text(); slowest = Math.max(slowest, Date.now() - t); return parseGarageStatuses(html); }
       catch (e) { return []; }                          // a page that fails this cycle just gets skipped; the next cycle/heavy covers it
     }));
+    // TIMING: `wall` is how long all pages together took (should ~= slowest if the pool truly parallelizes;
+    // ~= sum if they're still serializing at the box). Proves whether the pool helps and what the box's
+    // per-request floor is during races.
+    statusFast._lastMs = Date.now() - t0g;
+    if (statusFast._lastMs > 3000) console.log(`[fast] garage pages: ${uuids.length} across ${pool.length} session(s) — wall ${statusFast._lastMs}ms, slowest single ${slowest}ms (wall≈slowest ⇒ parallel & box is the floor; wall≈sum ⇒ still serializing)`);
     for (let _li = 0; _li < lists.length; _li++) {
       const pageType = (KART_TYPES[uuids[_li]] && KART_TYPES[uuids[_li]].type) || null;   // the track type this page represents
       for (const k of lists[_li]) {
