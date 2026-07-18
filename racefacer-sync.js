@@ -508,9 +508,14 @@ async function syncAllRepairs({ fullSweep = false } = {}) {
       // repair's user in RF changes THAT, while user_name can stay as the original creator —
       // which is why the TV kept crediting the old mechanic). Falls back to user_name.
       const mech = it.mechanic_name || it.repairer_name || it.repair_user_name || it.user_name || null;
+      // The ORIGINAL note the repair was logged against (RaceFacer shows it in the repair's expand row,
+      // separate from the annotation = what was done). Capture it so the app can show the same. Only keep
+      // it when it's actually a different text from the annotation, so we never duplicate the same line.
+      let dmgNote = it.damage_annotation || it.damage_description || it.notification_annotation || it.damage_note || '';
+      if (dmgNote && String(dmgNote).trim() === String(it.annotation || '').trim()) dmgNote = '';
       const row = {
         id: it.id, rf_kart_id: kid,
-        description: it.annotation || '', notes: '',
+        description: it.annotation || '', notes: '', damage_note: (dmgNote ? String(dmgNote) : null),
         date_discovered: dashToIso(it.damage_discovery_date),
         date_repaired: dashToIso(it.repair_date),
         mileage: (Number.isFinite(Number(it.repair_km)) ? Number(it.repair_km) : null),
