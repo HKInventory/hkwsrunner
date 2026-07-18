@@ -151,19 +151,24 @@ async function notesLoop(){
         catch (e) { if (/login|session|401|403/i.test(e.message || '')) dropLogin(); }
       }
       if (viaNotif) log(`notes: ${viaNotif} kart(s) changed (notifications)`);
-      const mode = viaNotif != null ? 'notifications-list' : 'page-sweep-only';
-      if (mode !== _lastNotesMode) { _lastNotesMode = mode; log(`notes fast-detection: ${mode}${mode === 'page-sweep-only' ? ` (notifications list unreadable — adds ride the ~${NOTES_PAGE_MS / 1000}s sweep)` : ''}`); }
 
-      // 2) AUTHORITATIVE but SLOW: the global Kart Notes page sweep — backfills rf_kart_note_id and
-      //    catches everything the fast path can't. Rare, because the page is huge.
-      if (Date.now() - _lastNotesPageAt >= NOTES_PAGE_MS) {
+      // 2) The global Kart Notes index (backfills rf_kart_note_id + detects adds/deletes fleet-wide). When
+      //    the index resolves to the FAST ajax source (kart-notes-table JSON, ~sub-second), run it EVERY
+      //    cycle so a note added/deleted in RaceFacer shows in ~one NOTES_POLL instead of waiting up to 90s
+      //    for the heavy page sweep. When only the SLOW server-rendered page works (~10s under race load),
+      //    keep it on the ~90s timer so it can't hammer the box. The detector is edge-triggered + memoised,
+      //    so calling it every cycle on the fast source is cheap.
+      const fastIdx = typeof sync.kniSource === 'function' && sync.kniSource() === 'table';
+      const mode = fastIdx ? 'kart-notes-table (fast)' : (viaNotif != null ? 'notifications-list' : 'page-sweep-only');
+      if (mode !== _lastNotesMode) { _lastNotesMode = mode; log(`notes fast-detection: ${mode}${mode === 'page-sweep-only' ? ` (notifications list + table unreadable — adds ride the ~${NOTES_PAGE_MS / 1000}s sweep)` : ''}`); }
+      if (fastIdx || Date.now() - _lastNotesPageAt >= NOTES_PAGE_MS) {
         _lastNotesPageAt = Date.now();
         let viaList = null;
         if (typeof sync.notesFromKartNotesPage === 'function') {
           try { viaList = await sync.notesFromKartNotesPage(); }
           catch (e) { viaList = null; log(`notes-page error: ${e.message}`); if (/login|session|401|403/i.test(e.message || '')) dropLogin(); }
         }
-        if (viaList) log(`notes: ${viaList} kart(s) changed & synced (page sweep)`);
+        if (viaList) log(`notes: ${viaList} kart(s) changed & synced (${fastIdx ? 'fast index' : 'page sweep'})`);
       }
 
       // wall-clock safety-net full per-kart sweep (rare backstop)
@@ -225,7 +230,7 @@ function loop(tag, gapMs, extraEnv){
   return { start(delay){ timer = setTimeout(run, delay || 0); }, stop(){ clearTimeout(timer); } };
 }
 
-log(`combined worker up · site=${SITE} · pusher live · status ~${STATUS_POLL / 1000}s · notes ~${NOTES_POLL / 1000}s (flagged) / ~${NOTES_POLL_ROTATE / 1000}s (rotating) · full-sync ~${HEAVY_GAP / 1000}s · build=kni-fix-2026-07-18r`);
+log(`combined worker up · site=${SITE} · pusher live · status ~${STATUS_POLL / 1000}s · notes ~${NOTES_POLL / 1000}s (flagged) / ~${NOTES_POLL_ROTATE / 1000}s (rotating) · full-sync ~${HEAVY_GAP / 1000}s · build=kni-fix-2026-07-18s`);
 
 // SESSIONS: poll RaceFacer session-management on the SAME shared login, so the app + HK AI
 // know which karts are in which session (and their time windows). Write-on-change; prunes to 7 days.

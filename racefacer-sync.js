@@ -906,8 +906,21 @@ const KNI_HEADERS = { 'Origin': RF_BASE, 'Referer': `${RF_BASE}/en/administratio
 async function _kniFetch(url){
   const out = [], seen = new Set();
   const add = (id, kart, note, archived) => { const n = Number(id); if (!n || seen.has(n)) return false; seen.add(n); out.push({ kartNoteId: n, rfKartId: (kart != null && /^\d+$/.test(String(kart))) ? Number(kart) : null, note: note != null ? String(note).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() : null, archived: archived === true ? true : (archived === false ? false : null) }); return true; };
+  // 1) plain ajax GET — on some builds this answers {html:<rows>} directly.
   let text = ''; try { text = await (await rf(url, { ajax: true, headers: KNI_HEADERS })).text(); } catch (e) { return { data: [], sample: '' }; }
   _kniExtractRaw(text, add);
+  if (out.length) return { data: out, sample: text.slice(0, 600) };
+  // 2) DataTables server-side POST — the *-table routes are DataTables endpoints that return an EMPTY
+  //    SHELL for a bare GET but the full row set for a draw request. The parser already understands both
+  //    the {html:...} and {data:[...]} response shapes, so we only need the request to return rows. This
+  //    is what makes the FAST fleet-wide note index (used every cycle) work instead of the slow page.
+  try {
+    const body = 'draw=1&start=0&length=3000&search%5Bvalue%5D=&order%5B0%5D%5Bcolumn%5D=0&order%5B0%5D%5Bdir%5D=desc';
+    const t2 = await (await rf(url, { method: 'POST', ajax: true, headers: { ...KNI_HEADERS, 'Content-Type': 'application/x-www-form-urlencoded' }, body })).text();
+    _kniExtractRaw(t2, add);
+    if (out.length) return { data: out, sample: t2.slice(0, 600) };
+    if (!text) text = t2;   // surface the POST body in diagnostics if the GET gave us nothing
+  } catch (e) { /* fall through to page source */ }
   return { data: out, sample: text.slice(0, 600) };
 }
 // Fetch the note index from the global Kart Notes PAGE (rows are server-rendered there, unlike the
@@ -935,7 +948,9 @@ async function getKartNoteIndex({ probe = true } = {}){
   {
     const r = await _kniFetch('/ajax/garage/kart-notes-table');
     if (r.data.length){ _kniSrc = 'table'; _kni = { at: Date.now(), data: r.data }; console.log(`[notes] kart-note index: ${r.data.length} notes via kart-notes-table`); return r.data; }
-    if (r.sample && !_kniDiag){ _kniDiag = true; try { await rfDebug('kart_notes_table_sample', 0, 'kart-notes-table returned no parseable rows (empty shell?) — using the page instead', r.sample); } catch (e) {} }
+    if (r.sample && !_kniDiag){ _kniDiag = true;
+      console.log(`[notes] kart-notes-table still no rows (GET+DataTables POST) — raw sample: ${String(r.sample).replace(/\s+/g, ' ').slice(0, 220)}`);
+      try { await rfDebug('kart_notes_table_sample', 0, 'kart-notes-table returned no parseable rows (empty shell?) — using the page instead', r.sample); } catch (e) {} }
   }
   // 2) the page (rows are rendered in its HTML) — this is the source that actually works here
   const d = await _fetchNotesViaPage();
@@ -1547,4 +1562,4 @@ async function main() {
 }
 
 if (require.main === module) main().catch((e) => { console.error(e); process.exit(1); });
-module.exports = { login, loginStatus, rfJson, enumerateKarts, syncKart, statusFast, reconcileToday, logTrackSegments, refreshLiveTracks, sweepNotesAll, notesFast, notesFromNotifications, notesFromKartNotesPage, getKartNoteIndex, readKartNotes, _kniExtractRaw };
+module.exports = { login, loginStatus, rfJson, enumerateKarts, syncKart, statusFast, reconcileToday, logTrackSegments, refreshLiveTracks, sweepNotesAll, notesFast, notesFromNotifications, notesFromKartNotesPage, getKartNoteIndex, readKartNotes, _kniExtractRaw, kniSource: () => _kniSrc };
