@@ -397,9 +397,36 @@ const dashToIso = (d) => { const m = /^(\d{2})-(\d{2})-(\d{4})$/.exec((d || '').
 const dashToDot = (d) => { const m = /^(\d{2})-(\d{2})-(\d{4})$/.exec((d || '').trim()); return m ? `${m[1]}.${m[2]}.${m[3]}` : ''; };
 const REPAIRS_PER_PAGE = parseInt(process.env.RF_REPAIRS_PER_PAGE, 10) || 500;
 
-async function syncAllRepairs() {
+async function syncAllRepairs({ fullSweep = false } = {}) {
   const byKart = new Map();              // rf_kart_id -> [{ dateDiscovered, dateRepaired, user, parts }]
   const byId = new Map();                // repair id -> { row, parts } — de-dupes across page boundaries
+
+  // ── read existing id->fingerprint FIRST, so an incremental run can stop at the stable tail ──
+  // Render meters OUTBOUND bytes; reads from Supabase are inbound (free-ish) — and knowing what we
+  // already have lets us stop FETCHING from RaceFacer early too (the real win here).
+  // PostgREST caps a response at 1000 rows, so page through ALL rows via Range headers.
+  let existing = new Map();
+  try {
+    const PAGE = 1000;
+    for (let from = 0; ; from += PAGE) {
+      const chunk = await sb('rf_repairs?select=id,fingerprint', { headers: { Range: `${from}-${from + PAGE - 1}`, 'Range-Unit': 'items' } });
+      if (!chunk || !chunk.length) break;
+      for (const r of chunk) existing.set(Number(r.id), r.fingerprint || '');
+      if (chunk.length < PAGE) break;
+    }
+    console.log(`[repairs] fingerprint map: ${existing.size} existing rows read`);
+  } catch (e) { console.error('[repairs] fingerprint pre-read failed (writing all):', (e.message || '').slice(0, 100)); }
+
+  // INCREMENTAL FETCH: repairs_list is newest-first by id, so any NEW or recently-EDITED repair is near
+  // the front. Once we hit a full page whose repairs are ALL already stored with an unchanged
+  // fingerprint, the far larger unchanged tail behind it doesn't need fetching — turning a 39-page
+  // (~19k-repair) fetch into ~1-2 pages on a quiet fleet. This is the single biggest RaceFacer-load cut
+  // in the heavy sync. THREE guards force a FULL fetch instead (so we never silently miss anything):
+  //   • first-ever run (nothing stored yet),
+  //   • an explicit fullSweep (periodic hourly safety net for edits to OLD repairs deep in the list),
+  //   • page 1 not actually descending-by-id (ordering assumption unverified -> don't risk stopping).
+  let forceFull = fullSweep || existing.size === 0;
+
   let page = 1, total = Infinity, guard = 0, fails = 0;
   while (guard++ < 5000) {
     let j;
@@ -420,7 +447,13 @@ async function syncAllRepairs() {
       console.log(`[repairs] mechanic candidates: user_name="${s.user_name||''}" mechanic_name="${s.mechanic_name||''}" repairer_name="${s.repairer_name||''}" repair_user_name="${s.repair_user_name||''}"`);
     }
     if (!items.length) break;                            // past the end
-    let added = 0;
+    // ORDERING GUARD: only trust early-stop if page 1 is genuinely newest-first (id descending). If it
+    // isn't, a new repair could be at the BACK, so we must fetch everything this run.
+    if (page === 1 && !forceFull && items.length > 1) {
+      const first = Number(items[0].id), last = Number(items[items.length - 1].id);
+      if (!(Number.isFinite(first) && Number.isFinite(last) && first > last)) { forceFull = true; console.log('[repairs] list not descending-by-id — full fetch this run'); }
+    }
+    let added = 0, pageChanged = 0;
     for (const it of items) {
       if (it.id == null || byId.has(it.id)) continue;    // skip dupes (a repair can straddle two pages)
       added++;
@@ -449,37 +482,19 @@ async function syncAllRepairs() {
       // Fingerprint = hash of the row content (+ parts) — lets each run skip unchanged rows
       // instead of rewriting the whole table every heavy pass. Any edit (incl. mechanic) changes it.
       row.fingerprint = contentHash(JSON.stringify(row) + '|' + JSON.stringify(parts));
+      if (!(existing.has(Number(row.id)) && existing.get(Number(row.id)) === row.fingerprint)) pageChanged++;   // new or edited
       byId.set(it.id, { row, parts });
       if (!byKart.has(kid)) byKart.set(kid, []);
       byKart.get(kid).push({ dateDiscovered: dashToDot(it.damage_discovery_date), dateRepaired: dashToDot(it.repair_date), user: it.user_name, parts });
     }
-    if (page === 1 || page % 10 === 0) console.log(`[repairs] page ${page}: +${added} (${byId.size} unique${Number.isFinite(total) ? '/' + total : ''})`);
+    if (page === 1 || page % 10 === 0) console.log(`[repairs] page ${page}: +${added} changed=${pageChanged} (${byId.size} unique${Number.isFinite(total) ? '/' + total : ''})`);
     page += 1;
     if (!added) break;                                   // no new rows this page -> end of list (or server ignoring the page param)
     if (byId.size >= total) break;                       // collected everything RaceFacer reports
+    if (!forceFull && pageChanged === 0) { console.log(`[repairs] incremental: page ${page - 1} fully known — stopping at stable tail (${byId.size} fetched).`); break; }
     await sleep(80);
   }
-  console.log(`[repairs] fetch complete: ${byId.size} unique repairs over ${page - 1} page(s)${Number.isFinite(total) ? ` (RaceFacer reports ${total})` : ''}.`);
-
-  // ── BANDWIDTH: only write what changed ─────────────────────────────────────
-  // Render meters the worker's OUTBOUND bytes; upserting every repair (and wiping/rebuilding
-  // every part line) each heavy pass was the biggest remaining GB source. Read the existing
-  // id->fingerprint map from Supabase (inbound = free on Render) and write only new/changed rows.
-  //
-  // CRITICAL: PostgREST caps a response at 1000 rows. With ~19k repairs, a plain select returned
-  // only the first 1000 fingerprints, so the other ~18k always looked "changed" and got rewritten
-  // EVERY heavy cycle (the 500-600 MB/hr bandwidth leak). Page through ALL rows via Range headers.
-  let existing = new Map();
-  try {
-    const PAGE = 1000;
-    for (let from = 0; ; from += PAGE) {
-      const chunk = await sb('rf_repairs?select=id,fingerprint', { headers: { Range: `${from}-${from + PAGE - 1}`, 'Range-Unit': 'items' } });
-      if (!chunk || !chunk.length) break;
-      for (const r of chunk) existing.set(Number(r.id), r.fingerprint || '');
-      if (chunk.length < PAGE) break;
-    }
-    console.log(`[repairs] fingerprint map: ${existing.size} existing rows read`);
-  } catch (e) { console.error('[repairs] fingerprint pre-read failed (writing all):', (e.message || '').slice(0, 100)); }
+  console.log(`[repairs] fetch complete: ${byId.size} unique repairs over ${page - 1} page(s) [${forceFull ? 'full' : 'incremental'}]${Number.isFinite(total) ? ` (RaceFacer reports ${total})` : ''}.`);
 
   const repairRows = [], partRows = [], changedIds = [];
   for (const { row, parts } of byId.values()) {
@@ -1278,17 +1293,33 @@ async function main() {
   const idMap = await enumerateKarts();           // Map: rf_id -> { site, type }
   console.log(`Syncing ${idMap.size} karts...`);
   try { await statusFast(); } catch (e) {}        // refresh OK/Damaged up-front so a status flip isn't stuck behind the whole pass
+  // Repairs: incremental most runs (stops at the stable tail), FULL once an hour to catch edits to old
+  // repairs deep in the list. The hourly gate uses rf_sync_state so it survives the per-run child spawn.
+  let repairsFull = false;
+  try { const st = await sb('rf_sync_state?k=eq.last_repairs_full&select=v'); const last = (st && st[0] && st[0].v) ? (Date.parse(st[0].v) || 0) : 0; repairsFull = (Date.now() - last >= 60 * 60 * 1000); } catch (e) { repairsFull = true; }
   let repairsByKart = new Map();
-  try { repairsByKart = await syncAllRepairs(); } // whole-fleet damage list -> rf_repairs / rf_repair_parts (+ map for reconcile)
+  try { repairsByKart = await syncAllRepairs({ fullSweep: repairsFull }); } // whole-fleet damage list -> rf_repairs / rf_repair_parts (+ map for reconcile)
   catch (e) { console.error('[repairs] full-fleet sync failed:', e.message); }
+
+  // Per-kart detail/parts sync, PARALLELIZED with a bounded worker pool and NO inter-kart sleep. The old
+  // sequential loop (230 karts x sleep(150) + fetches) ran ~60-90s and was the single biggest thing
+  // pinning the shared RaceFacer box and starving the in-process status/notes loops. A pool finishes the
+  // fleet in ~15-25s, so the contention window shrinks dramatically. Concurrency matches sweepNotesAll's
+  // proven profile; statusFast already ran up-front (above) and keeps running every ~2s in the main
+  // process, so it no longer needs interleaving here. (Heavy child skips per-kart NOTES via
+  // HEAVY_SKIP_KART_NOTES — see syncKart — so this is just details + parts.)
   const perKart = [], skipIds = new Set();
-  let done = 0;
-  for (const [id, meta] of idMap) {
-    try { const k = await syncKart(id, meta, repairsByKart); if (k && k.skipped) skipIds.add(id); else if (k) perKart.push(k); }
-    catch (e) { console.error(`kart ${id}: ${e.message}`); }
-    await sleep(150);
-    if (++done % 25 === 0) { try { await statusFast(); } catch (e) {} }   // keep status fresh through the long pass (~every 25 karts)
+  const entries = [...idMap.entries()];
+  let _ki = 0;
+  const KART_CONC = Math.max(2, Math.min(8, parseInt(process.env.HEAVY_KART_CONCURRENCY, 10) || 6));
+  async function _kartWorker(){
+    while (_ki < entries.length){
+      const [id, meta] = entries[_ki++];
+      try { const k = await syncKart(id, meta, repairsByKart); if (k && k.skipped) skipIds.add(id); else if (k) perKart.push(k); }
+      catch (e) { console.error(`kart ${id}: ${e.message}`); }
+    }
   }
+  await Promise.all(Array.from({ length: Math.min(KART_CONC, entries.length) }, () => _kartWorker()));
   if (skipIds.size) console.log(`[skip] ${skipIds.size} non-numeric-named karts (George/Late/test) excluded.`);
   const keepIds = [...idMap.keys()].filter((id) => !skipIds.has(id));   // real karts only (incl. ones that transiently failed)
   const pruned = await pruneStale(keepIds);
@@ -1296,7 +1327,9 @@ async function main() {
   const aliases = await refreshAliases(perKart.flatMap((k) => k.repairs.flatMap((r) => (r.parts || []).map((p) => p.name))));
   const n = await reconcileToday(perKart, aliases);
   const now = new Date().toISOString();
-  await sb('rf_sync_state?on_conflict=k', { method: 'POST', prefer: 'resolution=merge-duplicates', body: [{ k: 'last_sync', v: now, at: now }, { k: 'last_heavy', v: now, at: now }] });
+  const stateRows = [{ k: 'last_sync', v: now, at: now }, { k: 'last_heavy', v: now, at: now }];
+  if (repairsFull) stateRows.push({ k: 'last_repairs_full', v: now, at: now });   // reset the hourly full-repairs clock
+  await sb('rf_sync_state?on_conflict=k', { method: 'POST', prefer: 'resolution=merge-duplicates', body: stateRows });
   console.log(`Done. ${perKart.length} karts synced, ${pruned} ghosts removed, ${n} discrepancies flagged for today.`);
 }
 
