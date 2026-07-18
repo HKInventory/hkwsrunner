@@ -38,6 +38,16 @@ const insecure = new Agent({ connect: { rejectUnauthorized: false } }); // accep
 // shared one; everything else (notes, sessions, heavy read-backs) keeps `jar`.
 const jar = {};
 const jarStatus = {};
+// STATUS SESSION POOL. Because RaceFacer locks a session per in-flight request, statusFast's ~6 concurrent
+// garage-page fetches SERIALIZE at the box when they share ONE session — that's the ~5s status cycle
+// (6 x ~0.8s), even though the pusher (one request per session) is fast. So status gets a POOL of sessions
+// and spreads its fetches across them, running them truly in parallel at the box. jarStatus is pool[0].
+// RaceFacer already tolerates several concurrent HKWS sessions (sync + status + heavy child + pusher), so
+// a few more is fine; login is fault-tolerant (uses whichever pool members authenticated). STATUS_POOL_SIZE
+// tunes it; 1 restores single-session behaviour.
+const STATUS_POOL_SIZE = Math.max(1, Math.min(8, parseInt(process.env.STATUS_POOL_SIZE || '6', 10)));
+const jarPool = [jarStatus];
+for (let i = 1; i < STATUS_POOL_SIZE; i++) jarPool.push({});
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function storeCookies(res, j) {
   j = j || jar;
@@ -53,6 +63,9 @@ const cookieHeader = (j) => Object.entries(j || jar).map(([k, v]) => `${k}=${v}`
 // Use the dedicated status session when it's actually logged in (the main worker process), otherwise fall
 // back to the shared session (e.g. inside the spawned heavy child, which never establishes jarStatus).
 const statusJar = () => (jarStatus['laravel_session'] ? jarStatus : jar);
+// The logged-in members of the status pool; falls back to [statusJar()] (single session, e.g. in the
+// spawned heavy child where the pool was never established).
+const statusPool = () => { const p = jarPool.filter((j) => j['laravel_session']); return p.length ? p : [statusJar()]; };
 
 // Turn RaceFacer type + number into the team's label, e.g. "Adult Track" + "19" -> "Adult 19".
 function kartLabel(type, name) {
@@ -115,7 +128,15 @@ async function login(j) {
   return true;
 }
 // Establish/refresh the status loop's DEDICATED session (see the jarStatus note above).
-function loginStatus(){ return login(jarStatus); }
+// Log in EVERY pool session (parallel, fault-tolerant): status runs on whichever members authenticated,
+// so a RaceFacer session cap or a single failed login degrades to fewer parallel sessions, never a crash.
+async function loginStatus(){
+  const results = await Promise.allSettled(jarPool.map((j) => login(j)));
+  const ok = results.filter((r) => r.status === 'fulfilled').length;
+  if (!ok) throw new Error(`status pool: all ${jarPool.length} logins failed`);
+  if (ok < jarPool.length) console.log(`[fast] status session pool: ${ok}/${jarPool.length} sessions logged in (running on ${ok})`);
+  return true;
+}
 
 // ---- current track layout: pull RaceFacer's "track configurations", flag the live one ----
 // /settings -> track_configurations (id = the layout's identity, sub_track_id = physical track, name).
@@ -1277,7 +1298,9 @@ async function statusFast() {
   let scanned = 0, viaKI = false;
 
   // ---- primary: ONE karts-info JSON request ------------------------------------------------------
-  const kiAllowed = process.env.STATUS_VIA_KARTS_INFO !== '0'
+  // karts-info returned 0 records unscoped on this box (it's kart_id-scoped), so it's OPT-IN now
+  // (STATUS_VIA_KARTS_INFO=1) rather than the default — no point probing a dead endpoint hourly.
+  const kiAllowed = process.env.STATUS_VIA_KARTS_INFO === '1'
     && (_kiMode === 'karts-info' || _kiMode === null || Date.now() >= _kiRetryAt);
   if (kiAllowed) {
     try {
@@ -1322,12 +1345,14 @@ async function statusFast() {
     }
   }
 
-  // ---- fallback: the ~6 garage list-page fetches (site-filtered, on the status session) ----------
+  // ---- fallback: the ~6 garage list-page fetches, SPREAD ACROSS THE SESSION POOL so they run truly in
+  //      parallel at the box instead of serializing on one session's per-request lock ----------------
   if (!viaKI) {
     const uuids = Object.keys(KART_TYPES).filter((u) => (KART_TYPES[u].site || 'sydney') === SITE);
-    const sj = statusJar();
-    const lists = await Promise.all(uuids.map(async (uuid) => {
-      try { const html = await (await rf(`/en/administration/garage/garage?kart_type_uuid=${uuid}`, { jar: sj })).text(); return parseGarageStatuses(html); }
+    const pool = statusPool();
+    const lists = await Promise.all(uuids.map(async (uuid, i) => {
+      const j = pool[i % pool.length];   // one distinct session per concurrent fetch (round-robin if fewer than pages)
+      try { const html = await (await rf(`/en/administration/garage/garage?kart_type_uuid=${uuid}`, { jar: j })).text(); return parseGarageStatuses(html); }
       catch (e) { return []; }                          // a page that fails this cycle just gets skipped; the next cycle/heavy covers it
     }));
     for (let _li = 0; _li < lists.length; _li++) {
