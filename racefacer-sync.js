@@ -848,8 +848,9 @@ async function rfMaybeJson(path){ try { const t = await (await rf(path, { ajax:t
 let _kni = { at: 0, data: [] };     // short cache of the resolved index
 let _kniSrc = null;                 // null=unknown, 'table'=ajax endpoint works, 'page'=page HTML works
 let _kniFailed = false;             // true only when BOTH sources returned nothing (used for back-off)
-let _kniProbeAt = 0, _kniDiag = false;
+let _kniProbeAt = 0, _kniDiag = false, _kniFullProbeAt = 0;
 const _KNI_BACKOFF = 60 * 1000;   // short: a failed probe should not lock deletes out of the id lookup for long
+const _KNI_REPROBE = 5 * 60 * 1000;   // while stuck on the slow page, re-try the fast endpoint this often
 
 function _kniParse(j, add){
   const items = j && (j.data || j.aaData || j.items || j.rows || j.records || (Array.isArray(j) ? j : null));
@@ -902,7 +903,7 @@ function _kniExtractRaw(text, add){
 // The kart-notes-table ajax route returned an "empty shell" until we sent the same Referer/Origin the
 // karts-info endpoint needed (RaceFacer gates its ajax JSON on the request looking like it came from the
 // matching admin page). Send them so this fast source can actually populate.
-const KNI_HEADERS = { 'Origin': RF_BASE, 'Referer': `${RF_BASE}/en/administration/garage/kart-notes` };
+const KNI_HEADERS = { 'Origin': RF_BASE, 'Referer': `${RF_BASE}/en/administration/garage/kart-notes`, 'Accept-Encoding': 'gzip, deflate' };
 async function _kniFetch(url){
   const out = [], seen = new Set();
   const add = (id, kart, note, archived) => { const n = Number(id); if (!n || seen.has(n)) return false; seen.add(n); out.push({ kartNoteId: n, rfKartId: (kart != null && /^\d+$/.test(String(kart))) ? Number(kart) : null, note: note != null ? String(note).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() : null, archived: archived === true ? true : (archived === false ? false : null) }); return true; };
@@ -929,7 +930,9 @@ async function _fetchNotesViaPage(){
   const out = [], seen = new Set();
   const add = (id, kart, note, archived) => { const n = Number(id); if (!n || seen.has(n)) return false; seen.add(n); out.push({ kartNoteId: n, rfKartId: (kart != null && /^\d+$/.test(String(kart))) ? Number(kart) : null, note: note != null ? String(note).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() : null, archived: archived === true ? true : (archived === false ? false : null) }); return true; };
   try {
-    const html = await (await rf('/en/administration/garage/kart-notes')).text();
+    // gzip cuts this ~1MB server-rendered page to ~100KB on the wire (undici decompresses transparently),
+    // which is what makes a faster sweep cadence affordable within the outbound cap.
+    const html = await (await rf('/en/administration/garage/kart-notes', { headers: { 'Accept-Encoding': 'gzip, deflate' } })).text();
     if (/name=["']password["']|\/auth\/login/i.test(html || '')) throw new Error('session expired');
     for (const r of parseKartNotesTableRows(html)) add(r.kartNoteId, r.rfKartId, r.note, r.archived);
   } catch (e) { if (/session expired/.test(e.message || '')) throw e; }
@@ -937,12 +940,15 @@ async function _fetchNotesViaPage(){
 }
 async function getKartNoteIndex({ probe = true } = {}){
   if (_kni.data.length && Date.now() - _kni.at < 4000) return _kni.data;
+  // Periodically drop back to a FULL probe even while the slow page works, so a fast ajax endpoint that
+  // starts answering (params/box change) is picked up live without a redeploy. Diagnostic re-arms too.
+  if (_kniSrc === 'page' && Date.now() - _kniFullProbeAt > _KNI_REPROBE){ _kniSrc = null; _kniDiag = false; }
   // Known source -> just refetch it (kept fast + memoised so the loop and deletes both get fresh data).
   if (_kniSrc === 'table'){ const r = await _kniFetch('/ajax/garage/kart-notes-table'); if (r.data.length){ _kni = { at: Date.now(), data: r.data }; return r.data; } _kniSrc = null; }
   if (_kniSrc === 'page'){ const d = await _fetchNotesViaPage(); if (d.length){ _kni = { at: Date.now(), data: d }; return d; } _kniSrc = null; }
   // Only genuine "both sources failed" state backs off. A working page source is NOT a back-off.
   if (_kniSrc === null && _kniFailed && Date.now() - _kniProbeAt < _KNI_BACKOFF) return [];
-  _kniProbeAt = Date.now();
+  _kniProbeAt = Date.now(); _kniFullProbeAt = Date.now();
 
   // 1) the confirmed ajax endpoint (may return an empty shell -> no data -> fall through)
   {
