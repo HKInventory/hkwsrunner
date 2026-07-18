@@ -109,6 +109,11 @@ async function statusLoop(){
       if (fails <= 3 || fails % 10 === 0) log(`status poll error (${fails}): ${e.message}`);
       if (fails > 3) await sleep(Math.min(30000, fails * 1000));   // back off if RaceFacer is unhappy
     }
+    // INSTRUMENTATION: a status cycle should take ~1s (7 cheap list pages). If it's routinely much longer
+    // than the poll interval, RaceFacer is contended (usually by the heavy child mid-sweep) — that IS the
+    // status-latency symptom, logged here so a capture localizes it instead of us inferring it.
+    const _dt = Date.now() - t0;
+    if (_dt > 4000) log(`status cycle SLOW: ${_dt}ms (poll ${STATUS_POLL}ms) — RaceFacer contended`);
     await sleep(Math.max(0, STATUS_POLL - (Date.now() - t0)));
   }
 }
@@ -172,6 +177,12 @@ async function notesLoop(){
       if (fails <= 3 || fails % 10 === 0) log(`notes poll error (${fails}): ${e.message}`);
       if (fails > 3) await sleep(Math.min(30000, fails * 1000));
     }
+    // INSTRUMENTATION: same idea as statusLoop — a converged notes cycle is one page fetch + a couple of
+    // small DB reads. If it's routinely many seconds, the box is contended (or the 15min full sweep is
+    // running). This is what stretches the effective note-detection interval well past NOTES_POLL and
+    // makes note add/delete feel slow even when the poll interval is short.
+    const _dt = Date.now() - t0;
+    if (_dt > 6000) log(`notes cycle SLOW: ${_dt}ms — RaceFacer contended or full-sweep running`);
     const interval = haveSignal ? NOTES_POLL : NOTES_POLL_ROTATE;
     await sleep(Math.max(0, interval - (Date.now() - t0)));
   }
@@ -179,7 +190,14 @@ async function notesLoop(){
 
 // ---- HEAVY sync loop (spawn racefacer-sync.js; own process + login is fine at this cadence) ----
 const SCRIPT     = path.join(__dirname, 'racefacer-sync.js');
-const HEAVY_GAP  = Math.max(60,  parseInt(process.env.HEAVY_GAP_SEC     || '120', 10)) * 1000;
+// HEAVY_GAP is the pause AFTER a heavy child exits before the next spawns. Each heavy run pins the small
+// self-hosted RaceFacer box for ~60-120s (230 karts × 150ms sleep + a 39-page repairs fetch), so at the
+// old 120s gap a heavy sync was active roughly HALF the time — starving the in-process status/notes loops
+// that share that same box and making status latency swing from ~2s (quiet) to 8-13s (heavy running).
+// Repairs/parts/prune/reconcile (all the heavy child does that the fast loops don't) are NOT
+// latency-sensitive, so running them every ~5min instead of ~2min barely affects freshness while roughly
+// halving the window in which status/notes are contended. Override with HEAVY_GAP_SEC if needed.
+const HEAVY_GAP  = Math.max(60,  parseInt(process.env.HEAVY_GAP_SEC     || '300', 10)) * 1000;
 const TIMEOUT_MS = Math.max(120, parseInt(process.env.CYCLE_TIMEOUT_SEC || '600', 10)) * 1000;
 const SITE       = (process.env.SITE || 'sydney').trim().toLowerCase();
 
@@ -210,7 +228,7 @@ function loop(tag, gapMs, extraEnv){
   return { start(delay){ timer = setTimeout(run, delay || 0); }, stop(){ clearTimeout(timer); } };
 }
 
-log(`combined worker up · site=${SITE} · pusher live · status ~${STATUS_POLL / 1000}s · notes ~${NOTES_POLL / 1000}s (flagged) / ~${NOTES_POLL_ROTATE / 1000}s (rotating) · full-sync ~${HEAVY_GAP / 1000}s · build=kni-fix-2026-07-18d`);
+log(`combined worker up · site=${SITE} · pusher live · status ~${STATUS_POLL / 1000}s · notes ~${NOTES_POLL / 1000}s (flagged) / ~${NOTES_POLL_ROTATE / 1000}s (rotating) · full-sync ~${HEAVY_GAP / 1000}s · build=kni-fix-2026-07-18e`);
 
 // SESSIONS: poll RaceFacer session-management on the SAME shared login, so the app + HK AI
 // know which karts are in which session (and their time windows). Write-on-change; prunes to 7 days.
